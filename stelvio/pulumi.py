@@ -1,0 +1,320 @@
+import errno
+import logging
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+from importlib.metadata import version
+from io import BytesIO
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import requests
+from platformdirs import user_config_dir
+from pulumi.automation.errors import CommandError
+from rich.console import Console
+from rich.markup import escape
+
+if TYPE_CHECKING:
+    from stelvio.rich_deployment_handler import RichDeploymentHandler
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+logger = logging.getLogger(__name__)
+console = Console(soft_wrap=True)
+
+
+PULUMI_VERSION = "v" + version("pulumi")
+
+
+def _should_skip_diagnostic(message: str) -> bool:
+    return message.startswith("update failed") or "failed to register new resource" in message
+
+
+def _is_exception_line(line: str) -> bool:
+    return bool(re.match(r"^[A-Z][a-zA-Z0-9]*(?:Error|Exception|Warning)?\s*:", line))
+
+
+def _is_traceback_line(line: str) -> bool:
+    """Check if a line is part of a Python traceback."""
+    stripped = line.strip()
+    # Check if it's a traceback header or file reference
+    if stripped.startswith(("Traceback", 'File "')):
+        return True
+    # Check if it's indented code (starts with spaces)
+    return len(line) > 0 and line[0] == " "
+
+
+def _extract_last_exception_line(lines: list[str]) -> str | None:
+    """Extract the last line that looks like a Python exception."""
+    for original_line in reversed(lines):
+        line = original_line.strip()
+        if _is_exception_line(line):
+            return line
+    return None
+
+
+def _extract_last_non_traceback_line(lines: list[str]) -> str | None:
+    """Extract the last non-empty line that's not part of a traceback."""
+    for original_line in reversed(lines):
+        line = original_line.strip()
+        if line and not _is_traceback_line(line):
+            return line
+    return None
+
+
+def _remove_pulumi_noise(message: str) -> str:
+    """Remove Pulumi-specific noise from error message."""
+    message = re.sub(r"<ref \*\d+>\s*", "", message)
+    message = re.sub(r"(?m)^Running program .*$\n?", "", message)
+    return message.strip()
+
+
+def _parse_python_error(message: str) -> str:
+    """Extract clean error message from Python traceback."""
+    message = _remove_pulumi_noise(message)
+    lines = message.strip().split("\n")
+
+    # A program exception: everything after the last traceback is the error, whole. A
+    # multi-line message (an installer's output) has lines matching the exception regex
+    # below, so the line-picking fallbacks would show one of those instead.
+    traceback_starts = [
+        i for i, line in enumerate(lines) if line.startswith("Traceback (most recent call last):")
+    ]
+    if traceback_starts:
+        after_traceback = lines[traceback_starts[-1] + 1 :]
+        for i, line in enumerate(after_traceback):
+            if line.strip() and not _is_traceback_line(line):
+                return "\n".join(after_traceback[i:]).strip()
+
+    # Try to find the actual exception line first
+    exception_line = _extract_last_exception_line(lines)
+    if exception_line:
+        return exception_line
+
+    # Fallback to last non-empty, non-traceback line
+    fallback_line = _extract_last_non_traceback_line(lines)
+    if fallback_line:
+        return fallback_line
+
+    # Final fallback - return the cleaned message as-is
+    return message
+
+
+def _show_simple_error(e: CommandError, handler: "RichDeploymentHandler") -> None:
+    console.print("\n[bold red]| Error[/bold red]\n")
+
+    is_compact_preview = bool(
+        getattr(handler, "compact", False) and getattr(handler, "is_preview", False)
+    )
+    has_inline_errors = (
+        any(getattr(resource, "error", None) for resource in handler.resources.values())
+        and not is_compact_preview
+    )
+
+    if handler.error_diagnostics and not has_inline_errors:
+        shown_urns = set()
+
+        for diagnostic in handler.error_diagnostics:
+            message = diagnostic.message.strip()
+
+            if _should_skip_diagnostic(message):
+                continue
+
+            urn = diagnostic.urn or ""
+            if urn and urn in shown_urns:
+                continue
+            if urn:
+                shown_urns.add(urn)
+                resource_context = handler.describe_urn(urn)
+                if resource_context:
+                    console.print(f"[bold red]Resource:[/bold red] {escape(resource_context)}")
+
+            # Parse and clean the error message
+            clean_message = _parse_python_error(message)
+            console.print(f"[red]{escape(clean_message)}[/red]")
+            # console.print(e.stack_trace, style="dim")
+
+            # For now, just show the first error to avoid spam
+            break
+    elif has_inline_errors:
+        console.print("[red]See failed resource details above.[/red]")
+    else:
+        # Fallback to CommandError
+        console.print(f"[red]{escape(str(e))}[/red]")
+
+    console.print()
+    handler.show_completion(failed=True)
+
+
+def print_operation_header(operation: str, app_name: str, environment: str) -> None:
+    console.print(f"{operation} ", style="bold", end="")
+    console.print(f"{app_name}", style="bold cyan", end="")
+    console.print(" → ", style="dim", end="")
+    console.print(f"{environment}", style="bold yellow")
+
+
+def get_stelvio_config_dir() -> Path:
+    return Path(user_config_dir(appname="stelvio"))
+
+
+def get_bin_path() -> Path:
+    stelvio_bin_path = get_stelvio_config_dir() / "bin"
+    stelvio_bin_path.mkdir(parents=True, exist_ok=True)
+    return stelvio_bin_path
+
+
+def pulumi_path() -> Path:
+    executable_name = "pulumi.exe" if sys.platform == "win32" else "pulumi"
+    return get_bin_path() / executable_name
+
+
+def needs_pulumi() -> bool:
+    pulumi_exe_path = pulumi_path()
+    if not pulumi_exe_path.exists():
+        return True
+    try:
+        process = subprocess.run(  # noqa: S603
+            [str(pulumi_exe_path), "version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        return process.returncode != 0 or process.stdout.strip() != PULUMI_VERSION
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        return True
+
+
+def ensure_pulumi(*, show_status: bool = True) -> None:
+    """Download Pulumi if not installed or version mismatch."""
+    if not needs_pulumi():
+        return
+    # The spinner also covers the wait for another process's install, so a second `stlv`
+    # started during a download does not look hung.
+    status = console.status("Downloading Pulumi...") if show_status else nullcontext()
+    with status, _install_lock():
+        if needs_pulumi():  # unless another process installed it while we waited
+            install_pulumi()
+
+
+@contextmanager
+def _install_lock() -> Iterator[None]:
+    """One installer at a time across processes. Two `stlv` commands on a cold machine (or
+    a test run's workers) otherwise race on the shared bin/: one deletes the other's extract
+    dir and both overwrite `bin/pulumi` while the other may be running it. The lock file
+    stays on disk, empty."""
+    with (get_bin_path() / "install.lock").open("a") as lock_file:
+        if sys.platform == "win32":
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError as e:
+                    # LK_LOCK gives up after 10 s with EDEADLOCK; a download takes longer.
+                    # Anything else (EBADF, EINVAL) would spin forever, so it raises.
+                    if e.errno != errno.EDEADLK:
+                        raise
+            try:
+                yield
+            finally:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)  # released on close, or by the kernel on exit
+            yield
+
+
+def _download_with_retry(url: str, max_retries: int = 3, delay: float = 2.0) -> bytes:
+    """Download URL content with retry logic."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            with requests.get(url, timeout=600) as r:
+                r.raise_for_status()
+                return r.content
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                logger.warning("Download attempt %d failed, retrying...", attempt + 1)
+                time.sleep(delay)
+                delay *= 2
+    raise RuntimeError(f"Failed to download Pulumi after {max_retries} attempts: {last_error}")
+
+
+def install_pulumi() -> None:
+    os_map = {"linux": "linux", "darwin": "darwin", "win32": "windows"}
+    arch_map = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}
+
+    current_os, current_arch = sys.platform, platform.machine().lower()
+
+    if current_os not in os_map or current_arch not in arch_map:
+        raise RuntimeError(f"Unsupported OS/Arch: {current_os}/{current_arch}")
+
+    pulumi_os, pulumi_arch = os_map[current_os], arch_map[current_arch]
+    archive_ext = ".zip" if pulumi_os == "windows" else ".tar.gz"
+    url = (
+        f"https://github.com/pulumi/pulumi/releases/download/{PULUMI_VERSION}"
+        f"/pulumi-{PULUMI_VERSION}-{pulumi_os}-{pulumi_arch}{archive_ext}"
+    )
+
+    logger.info("Downloading Pulumi from %s", url)
+
+    tmp_path = get_bin_path() / "pulumi_tmp"
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        content = _download_with_retry(url)
+        logger.info("Extracting Pulumi to %s", tmp_path)
+        if archive_ext == ".tar.gz":
+            with tarfile.open(fileobj=BytesIO(content), mode="r:gz") as tar:
+                tar.extractall(tmp_path, filter="data")
+        else:
+            with zipfile.ZipFile(BytesIO(content), "r") as zip_ref:
+                zip_ref.extractall(tmp_path)  # noqa: S202
+
+        move_pulumi_to_bin(pulumi_os, tmp_path)
+        logger.info("Pulumi installed to %s", get_bin_path())
+    except (tarfile.TarError, zipfile.BadZipFile) as e:
+        raise RuntimeError(f"Failed to extract Pulumi archive: {e}") from e
+    finally:
+        if tmp_path.exists():
+            shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def move_pulumi_to_bin(pulumi_os: str, tmp_path: Path) -> None:
+    dir_to_copy = tmp_path / "pulumi"
+    if pulumi_os == "windows":
+        dir_to_copy /= "bin"
+    # The CLI lands last: needs_pulumi() only asks `bin/pulumi version`, so a caller checking
+    # mid-install, or after a killed one, must not take a bin/ without the language plugins
+    # for installed (every later command would fail with "missing executor").
+    for item in sorted(dir_to_copy.iterdir(), key=lambda entry: entry.stem == "pulumi"):
+        destination_path = get_bin_path() / item.name
+        if destination_path.exists():
+            if item.is_file():
+                destination_path.unlink()
+            elif item.is_dir():
+                shutil.rmtree(destination_path)
+        shutil.move(str(item), str(destination_path))
+
+
+# Convert Pulumi Input Args to dict
+def normalize_pulumi_args_to_dict(val: object) -> dict:
+    if val is None:
+        return {}
+    if isinstance(val, dict):
+        return val
+    if hasattr(val, "__dict__"):
+        return vars(val)
+    raise ValueError(f"Cannot convert customization value to dict: {val}")

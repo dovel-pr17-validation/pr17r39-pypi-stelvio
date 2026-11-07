@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, TypedDict, final
+
+import pulumi_aws
+
+from stelvio import context
+from stelvio.component import Component
+from stelvio.dns import DnsProviderNotConfiguredError, Record
+from stelvio.provider import ProviderStore
+
+if TYPE_CHECKING:
+    import pulumi
+    from pulumi_aws.acm import CertificateArgs, CertificateValidationArgs
+
+    from stelvio.customize import Customization, CustomizationNoArgs
+
+
+@final
+@dataclass(frozen=True)
+class AcmValidatedDomainResources:
+    certificate: pulumi_aws.acm.Certificate
+    validation_record: Record
+    cert_validation: pulumi_aws.acm.CertificateValidation
+
+
+class AcmValidatedDomainCustomizationDict(TypedDict, total=False):
+    certificate: Customization[CertificateArgs]
+    validation_record: CustomizationNoArgs  # No specific Pulumi Args (cross cloud compat)
+    cert_validation: Customization[CertificateValidationArgs]
+
+
+@final
+class AcmValidatedDomain(
+    Component[AcmValidatedDomainResources, AcmValidatedDomainCustomizationDict]
+):
+    def __init__(  # noqa: PLR0913
+        self,
+        name: str,
+        domain_name: str,
+        region: str | None = None,
+        *,
+        tags: dict[str, str] | None = None,
+        customize: AcmValidatedDomainCustomizationDict | None = None,
+        parent: pulumi.Resource | None = None,
+    ):
+        super().__init__(
+            ProviderStore.aws(),
+            "stelvio:aws:AcmValidatedDomain",
+            name,
+            tags=tags,
+            customize=customize,
+            parent=parent,
+        )
+        self._domain_name = domain_name
+        self._region = region
+
+    def _create_resources(self) -> AcmValidatedDomainResources:
+        dns = context().dns
+        if dns is None:
+            raise DnsProviderNotConfiguredError(
+                "DNS provider is not configured in the context. "
+                "Please set up a DNS provider to use custom domains."
+            )
+
+        cross_region_provider = (
+            ProviderStore.aws_for_region(self._region) if self._region else None
+        )
+
+        # 1 - Issue Certificate
+        certificate = pulumi_aws.acm.Certificate(
+            context().prefix(f"{self.name}-certificate"),
+            **self._customizer(
+                "certificate",
+                {
+                    "domain_name": self._domain_name,
+                },
+                default_props={
+                    "validation_method": "DNS",
+                },
+                inject_tags=True,
+            ),
+            opts=self._resource_opts(provider=cross_region_provider),
+        )
+
+        # 2 - Validate Certificate with DNS PROVIDER
+        first_option = certificate.domain_validation_options.apply(lambda options: options[0])
+        validation_record = dns.create_record(
+            resource_name=context().prefix(f"{self.name}-certificate-validation-record"),
+            name=first_option.apply(lambda opt: opt["resource_record_name"]),
+            **self._customizer(
+                "validation_record",
+                {},
+                default_props={
+                    "record_type": first_option.apply(lambda opt: opt["resource_record_type"]),
+                    "value": first_option.apply(lambda opt: opt["resource_record_value"]),
+                    "ttl": 1,
+                },
+            ),
+            # No provider pin: a custom DNS adapter may bring its own, e.g. for a hosted zone
+            # in another account, and a pin here would win over it.
+            opts=self._resource_opts(),
+        )
+
+        # 3 - Wait for validation - use the validation record's FQDN to ensure it exists
+        cert_validation = pulumi_aws.acm.CertificateValidation(
+            context().prefix(f"{self.name}-certificate-validation"),
+            **self._customizer(
+                "cert_validation",
+                {},
+                {
+                    "certificate_arn": certificate.arn,
+                    "validation_record_fqdns": [validation_record.name],
+                },
+            ),
+            opts=self._resource_opts(
+                depends_on=[certificate, validation_record.pulumi_resource],
+                provider=cross_region_provider,
+            ),
+        )
+
+        return AcmValidatedDomainResources(
+            certificate=certificate,
+            validation_record=validation_record,
+            cert_validation=cert_validation,
+        )

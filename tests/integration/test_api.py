@@ -1,0 +1,266 @@
+import pytest
+
+from stelvio.aws.api_gateway import RestApi
+from stelvio.aws.cognito import UserPool
+from stelvio.aws.function import Function
+from stelvio.component import ComponentRegistry
+
+from .assert_helpers import (
+    assert_api_authorizers,
+    assert_api_cors_headers,
+    assert_api_method_auth,
+    assert_api_routes,
+    assert_apigateway_tags,
+    assert_lambda_tags,
+)
+from .export_helpers import export_api, export_function, export_user_pool
+
+pytestmark = pytest.mark.integration
+
+
+# --- Routes ---
+
+
+def test_api_basic(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("myapi")
+        api.route("GET", "/hello", "handlers/echo.main")
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert outputs["api_myapi_url"].startswith("https://")
+    assert_api_routes(
+        outputs["api_myapi_id"],
+        expected_routes={"/hello": ["GET"]},
+    )
+
+
+def test_api_tags_and_generated_function_tags(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("tagged-api", tags={"Team": "platform"})
+        api.route("GET", "/hello", "handlers/echo.main")
+        export_api(api)
+        fn = ComponentRegistry.get_component_by_name("tagged-api-handlers-echo_main")
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+    assert_apigateway_tags(outputs["api_tagged-api_arn"], {"Team": "platform"})
+    assert_lambda_tags(outputs["function_tagged-api-handlers-echo_main_arn"], {"Team": "platform"})
+
+
+def test_api_multiple_routes(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("multi")
+        api.route("GET", "/hello", "handlers/echo.main")
+        api.route("POST", "/items", "handlers/echo.main")
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_api_routes(
+        outputs["api_multi_id"],
+        expected_routes={"/hello": ["GET"], "/items": ["POST"]},
+    )
+
+
+def test_api_any_method(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("anyapi")
+        api.route("ANY", "/proxy", "handlers/echo.main")
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_api_routes(
+        outputs["api_anyapi_id"],
+        expected_routes={"/proxy": ["ANY"]},
+    )
+
+
+def test_api_path_parameters(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("pathapi")
+        api.route("GET", "/users", "handlers/echo.main")
+        api.route("GET", "/users/{id}", "handlers/echo.main")
+        api.route("GET", "/users/{id}/orders/{order_id}", "handlers/echo.main")
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_api_routes(
+        outputs["api_pathapi_id"],
+        expected_routes={
+            "/users": ["GET"],
+            "/users/{id}": ["GET"],
+            "/users/{id}/orders/{order_id}": ["GET"],
+        },
+    )
+
+
+def test_api_multiple_methods_same_path(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("methapi")
+        api.route(["GET", "POST", "DELETE"], "/items", "handlers/echo.main")
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_api_routes(
+        outputs["api_methapi_id"],
+        expected_routes={"/items": ["GET", "POST", "DELETE"]},
+    )
+
+
+# --- CORS ---
+
+
+def test_api_cors(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("corsapi", cors=True)
+        api.route("GET", "/hello", "handlers/echo.main")
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_api_cors_headers(outputs["api_corsapi_url"], path="/hello")
+
+
+# --- Authorizers ---
+
+
+def test_api_token_authorizer(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("authapi")
+        auth = api.add_token_authorizer("jwt", "handlers/auth.handler")
+        api.route("GET", "/protected", "handlers/echo.main", auth=auth)
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    api_id = outputs["api_authapi_id"]
+    assert_api_authorizers(api_id, expected_types=["TOKEN"])
+    assert_api_method_auth(api_id, path="/protected", method="GET", auth_type="CUSTOM")
+
+
+def test_api_request_authorizer(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("reqauth")
+        auth = api.add_request_authorizer("reqjwt", "handlers/auth.handler")
+        api.route("GET", "/secure", "handlers/echo.main", auth=auth)
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    api_id = outputs["api_reqauth_id"]
+    assert_api_authorizers(api_id, expected_types=["REQUEST"])
+    assert_api_method_auth(api_id, path="/secure", method="GET", auth_type="CUSTOM")
+
+
+def test_api_default_auth_with_public_override(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("defauth")
+        auth = api.add_token_authorizer("jwt", "handlers/auth.handler")
+        api.default_auth = auth
+        api.route("GET", "/protected", "handlers/echo.main")
+        api.route("GET", "/health", "handlers/echo.main", auth=False)
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    api_id = outputs["api_defauth_id"]
+    assert_api_method_auth(api_id, path="/protected", method="GET", auth_type="CUSTOM")
+    assert_api_method_auth(api_id, path="/health", method="GET", auth_type="NONE")
+
+
+def test_api_iam_auth(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("iamapi")
+        api.route("GET", "/admin", "handlers/echo.main", auth="IAM")
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_api_method_auth(
+        outputs["api_iamapi_id"],
+        path="/admin",
+        method="GET",
+        auth_type="AWS_IAM",
+    )
+
+
+def test_api_multiple_authorizers(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("multiauth")
+        token_auth = api.add_token_authorizer("token", "handlers/auth.handler")
+        request_auth = api.add_request_authorizer("request", "handlers/auth.handler")
+        api.route("GET", "/token-protected", "handlers/echo.main", auth=token_auth)
+        api.route("GET", "/request-protected", "handlers/echo.main", auth=request_auth)
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    api_id = outputs["api_multiauth_id"]
+    assert_api_authorizers(api_id, expected_types=["TOKEN", "REQUEST"])
+    assert_api_method_auth(api_id, path="/token-protected", method="GET", auth_type="CUSTOM")
+    assert_api_method_auth(api_id, path="/request-protected", method="GET", auth_type="CUSTOM")
+
+
+def test_api_cognito_authorizer(stelvio_env, project_dir):
+    def infra():
+        pool = UserPool("cogpool", usernames=["email"])
+        api = RestApi("cogapi")
+        auth = api.add_cognito_authorizer("cognito", user_pools=[pool])
+        api.route("GET", "/protected", "handlers/echo.main", auth=auth)
+        export_api(api)
+        export_user_pool(pool)
+
+    outputs = stelvio_env.deploy(infra)
+
+    api_id = outputs["api_cogapi_id"]
+    pool_arn = outputs["user_pool_cogpool_arn"]
+    assert_api_authorizers(
+        api_id,
+        expected_types=["COGNITO_USER_POOLS"],
+        expected_provider_arns=[pool_arn],
+    )
+    assert_api_method_auth(
+        api_id,
+        path="/protected",
+        method="GET",
+        auth_type="COGNITO_USER_POOLS",
+    )
+
+
+# --- Shared handler and stage ---
+
+
+def test_api_shared_handler(stelvio_env, project_dir):
+    def infra():
+        fn = Function("shared", handler="handlers/echo.main")
+        api = RestApi("sharedapi")
+        api.route("GET", "/one", fn)
+        api.route("POST", "/two", fn)
+        export_function(fn)
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_api_routes(
+        outputs["api_sharedapi_id"],
+        expected_routes={"/one": ["GET"], "/two": ["POST"]},
+    )
+    # Both routes use the same function — only one function created
+    assert "function_shared_arn" in outputs
+
+
+def test_api_custom_stage_name(stelvio_env, project_dir):
+    def infra():
+        api = RestApi("stageapi", stage_name="prod")
+        api.route("GET", "/hello", "handlers/echo.main")
+        export_api(api)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert outputs["api_stageapi_stage_name"] == "prod"
+    assert outputs["api_stageapi_url"].endswith("/prod")

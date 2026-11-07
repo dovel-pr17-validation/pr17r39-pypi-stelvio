@@ -1,0 +1,342 @@
+# noqa: INP001  # shipped alone as stlv_function_stub.py in the stub Lambda zip, no package
+
+"""
+Stub Lambda handler - forwards invocations to local dev server via AppSync.
+Uses connection reuse for better performance.
+"""
+
+import asyncio
+import base64
+import json
+import os
+import time
+import uuid
+
+import stlv_chunking
+import websockets
+from stlv_chunking import STUB_LAMBDA_ENV_KEYS, channel_segment, wait_for_appsync_ack
+
+# Environment variables (set by deployment)
+APPSYNC_REALTIME = os.environ["STLV_APPSYNC_REALTIME"]
+APPSYNC_HTTP = os.environ["STLV_APPSYNC_HTTP"]
+API_KEY = os.environ["STLV_APPSYNC_API_KEY"]
+APP_NAME = os.environ.get("STLV_APP_NAME", "stlv")
+STAGE = os.environ.get("STLV_STAGE", "dev")
+FUNCTION_NAME = os.environ.get("STLV_FUNCTION_NAME", "unknown")
+ENDPOINT_ID = os.environ.get("STLV_DEV_ENDPOINT_ID", "endpoint_id")
+
+APP_SEGMENT = channel_segment(APP_NAME)
+STAGE_SEGMENT = channel_segment(STAGE)
+
+WEBSOCKET_STALE_TIMEOUT = 240  # 4 minutes
+RESPONSE_WAIT_MAX = 25  # under API Gateway's 29 s integration timeout
+
+# Global state for connection reuse (survives across warm container invocations)
+_event_loop = None
+_ws_connection = None
+_last_connected = None
+_subscribed = False
+
+# Chunk buffers for reassembling chunked responses
+_response_chunk_buffers = {}
+
+
+def get_or_create_loop() -> asyncio.AbstractEventLoop:
+    """Get existing event loop or create new one."""
+    global _event_loop  # noqa: PLW0603
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_event_loop)
+    return _event_loop
+
+
+async def connect_to_appsync() -> websockets.WebSocketClientProtocol:
+    """Connect to AppSync Events WebSocket."""
+    # Create auth header
+    auth_header = {"host": APPSYNC_HTTP, "x-api-key": API_KEY}
+
+    # Encode as base64 subprotocol
+    auth_b64 = base64.b64encode(json.dumps(auth_header).encode()).decode()
+    auth_b64 = auth_b64.replace("+", "-").replace("/", "_").replace("=", "")
+
+    # Connect
+    uri = f"wss://{APPSYNC_REALTIME}/event/realtime"
+    # Lambda freezes this event loop between invocations. A background ping deadline can expire
+    # while frozen and close a healthy reused connection on thaw.
+    ws = await websockets.connect(
+        uri, subprotocols=["aws-appsync-event-ws", f"header-{auth_b64}"], ping_interval=None
+    )
+
+    try:
+        # Send connection_init
+        await ws.send(json.dumps({"type": "connection_init"}))
+
+        # Wait for connection_ack
+        await wait_for_appsync_ack(ws, "connection_ack")
+    except BaseException:
+        ws.transport.abort()
+        raise
+
+    return ws
+
+
+async def subscribe_to_channel(ws: websockets.WebSocketClientProtocol) -> None:
+    """Subscribe to response channel."""
+    response_channel = f"/stelvio/{APP_SEGMENT}/{STAGE_SEGMENT}/out"
+    await ws.send(
+        json.dumps(
+            {
+                "type": "subscribe",
+                "id": "response-sub",
+                "channel": response_channel,
+                "authorization": {"x-api-key": API_KEY},
+            }
+        )
+    )
+
+    await wait_for_appsync_ack(
+        ws, "subscribe_success", operation_id="response-sub", channel=response_channel
+    )
+
+
+def _drop_connection() -> None:
+    """Forget the cached connection and abort its socket, so the next call reconnects."""
+    global _ws_connection, _last_connected, _subscribed  # noqa: PLW0603
+
+    if _ws_connection is not None:
+        _ws_connection.transport.abort()
+    _ws_connection = None
+    _last_connected = None
+    _subscribed = False
+
+
+async def get_or_create_connection() -> tuple[websockets.WebSocketClientProtocol, bool]:
+    """Get existing connection or create new one."""
+    global _ws_connection, _last_connected  # noqa: PLW0603
+
+    # Check if we have a valid connection
+    if _ws_connection is not None:
+        try:
+            # Check if connection is still open (websockets uses close_code)
+            # If close_code is None, connection is still open
+            if _ws_connection.close_code is None:
+                # Check that the connection is recent enough to reuse.
+                age = time.time() - _last_connected
+                if age < WEBSOCKET_STALE_TIMEOUT:
+                    return _ws_connection, True  # Reused!
+        except Exception:  # noqa: S110
+            pass  # Connection is bad, create new one
+
+    _drop_connection()
+    _ws_connection = await connect_to_appsync()
+    _last_connected = time.time()
+    return _ws_connection, False  # New connection
+
+
+async def ensure_subscribed(ws: websockets.WebSocketClientProtocol) -> None:
+    """Ensure we're subscribed to response channel."""
+    global _subscribed  # noqa: PLW0603
+    if not _subscribed:
+        await subscribe_to_channel(ws)
+        _subscribed = True
+
+
+async def publish_to_appsync(
+    ws: websockets.WebSocketClientProtocol, channel: str, data: dict
+) -> None:
+    """Publish message to AppSync channel."""
+
+    await ws.send(
+        json.dumps(
+            {
+                "id": str(uuid.uuid4()),  # Required by AppSync Events!
+                "type": "publish",
+                "channel": channel,
+                "events": [json.dumps(data)],
+                "authorization": {"x-api-key": API_KEY},
+            }
+        )
+    )
+
+
+async def publish_with_chunking(
+    ws: websockets.WebSocketClientProtocol, channel: str, data: dict, request_id: str
+) -> None:
+    """Publish message to AppSync channel, chunking if necessary."""
+    chunks = stlv_chunking.split_message(data, request_id)
+    for chunk in chunks:
+        await publish_to_appsync(ws, channel, chunk)
+
+
+async def wait_for_response(
+    ws: websockets.WebSocketClientProtocol, request_id: str, timeout: float
+) -> dict | None:
+    """Wait for response from local dev server."""
+    global _response_chunk_buffers  # noqa: PLW0602
+    start = time.time()
+
+    while time.time() - start < timeout:
+        try:
+            message = await asyncio.wait_for(ws.recv(), timeout=timeout - (time.time() - start))
+
+            data = json.loads(message)
+
+            # Check for keepalive - also clean up stale buffers
+            if data.get("type") == "ka":
+                stlv_chunking.cleanup_stale_buffers(_response_chunk_buffers)
+                continue
+
+            # Check if this is a data message
+            if data.get("type") == "data":
+                event_data = json.loads(data["event"])
+
+                # Handle chunked messages
+                if stlv_chunking.is_chunked_message(event_data):
+                    # Only process chunks for our request
+                    if event_data.get("requestId") == request_id:
+                        complete_msg, is_complete = stlv_chunking.reassemble_chunk(
+                            event_data, _response_chunk_buffers
+                        )
+                        if is_complete:
+                            return complete_msg
+                    continue
+
+                # Check if it matches our request ID (non-chunked message)
+                if event_data.get("requestId") == request_id:
+                    return event_data
+
+        except TimeoutError:
+            break
+
+    return None
+
+
+def handler(event: dict, context: object) -> dict:
+    """Lambda handler - manages event loop manually for connection reuse."""
+    loop = get_or_create_loop()
+    return loop.run_until_complete(async_handler(event, context))
+
+
+async def async_handler(event: dict, context: object) -> dict:  # noqa: PLR0911
+    """Async handler implementation."""
+
+    # Track timing
+    t_start = time.time()
+    timings = {}
+
+    # Get or create connection
+    t_connect_start = time.time()
+    try:
+        ws, _reused = await get_or_create_connection()
+        timings["connect"] = int((time.time() - t_connect_start) * 1000)
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Failed to connect to AppSync: {e!s}"}),
+        }
+
+    # Ensure subscribed
+    t_subscribe_start = time.time()
+    try:
+        await ensure_subscribed(ws)
+        _subscribe_time = int((time.time() - t_subscribe_start) * 1000)
+    except Exception as e:
+        _drop_connection()
+        return {"statusCode": 500, "body": json.dumps({"error": f"Failed to subscribe: {e!s}"})}
+
+    # Publish invocation to local dev server
+    request_channel = f"/stelvio/{APP_SEGMENT}/{STAGE_SEGMENT}/in"
+    cognito_identity = None
+    if getattr(context, "identity", None) is not None:
+        cognito_identity = {
+            "cognito_identity_id": getattr(context.identity, "cognito_identity_id", None),
+            "cognito_identity_pool_id": getattr(
+                context.identity, "cognito_identity_pool_id", None
+            ),
+        }
+    request_message = {
+        "requestId": getattr(context, "aws_request_id", None),
+        "invoke_id": getattr(context, "aws_request_id", None),
+        "endpointId": ENDPOINT_ID,
+        "functionName": FUNCTION_NAME,
+        # The local handler sees the deployed function's values, as in a real invocation
+        "lambdaEnv": {key: os.environ[key] for key in STUB_LAMBDA_ENV_KEYS if key in os.environ},
+        "event": event,
+        "context": {
+            "invoke_id": getattr(context, "aws_request_id", None),
+            "client_context": getattr(context, "client_context", None),
+            "cognito_identity": cognito_identity,
+            "epoch_deadline_time_in_ms": context._epoch_deadline_time_in_ms,  # noqa: SLF001
+            "invoked_function_arn": getattr(context, "invoked_function_arn", None),
+            "tenant_id": getattr(context, "tenant_id", None),
+        },
+    }
+
+    t_publish_start = time.time()
+    try:
+        await publish_with_chunking(ws, request_channel, request_message, context.aws_request_id)
+        timings["publish"] = int((time.time() - t_publish_start) * 1000)
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps(
+                {
+                    "error": f"Failed to publish to AppSync: {e!s}",
+                    "request_channel": request_channel,
+                    "request_message": request_message,
+                }
+            ),
+        }
+
+    # Wait for response
+    t_wait_start = time.time()
+    try:
+        # The stub runs with the Function's timeout, capped: with `stlv dev` stopped the hint
+        # below must beat API Gateway's 29 s, and a cron/queue stub must not burn a long
+        # timeout per call. The 0.5 s left over returns the hint, not Lambda's "Task timed out".
+        timeout = min(context.get_remaining_time_in_millis() / 1000 - 0.5, RESPONSE_WAIT_MAX)
+        response = await wait_for_response(ws, context.aws_request_id, timeout=timeout)
+        timings["wait"] = int((time.time() - t_wait_start) * 1000)
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Error waiting for response: {e!s}"}),
+        }
+
+    if response is None:
+        _drop_connection()
+        timings["total"] = int((time.time() - t_start) * 1000)
+        return {
+            "statusCode": 500,
+            "body": json.dumps(
+                {
+                    "error": f"Local dev server did not respond within {timeout:.1f} s",
+                    "hint": "Is 'stlv dev' running? If it is, the handler took longer than "
+                    f"the Function's timeout or the {RESPONSE_WAIT_MAX} s dev cap.",
+                    "timings": timings,
+                    "env": {
+                        "APP_NAME": APP_NAME,
+                        "STAGE": STAGE,
+                        "FUNCTION_NAME": FUNCTION_NAME,
+                        "ENDPOINT_ID": ENDPOINT_ID,
+                    },
+                }
+            ),
+        }
+
+    # Calculate total time
+    timings["total"] = int((time.time() - t_start) * 1000)
+
+    if response.get("success"):
+        return response["result"]
+    # Error from local dev
+    return {
+        "statusCode": 500,
+        "body": json.dumps(
+            {
+                "error": response.get("error"),
+                "errorType": response.get("errorType"),
+                "stackTrace": response.get("stackTrace"),
+            }
+        ),
+    }

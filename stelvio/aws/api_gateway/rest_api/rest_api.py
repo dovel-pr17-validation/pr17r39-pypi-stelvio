@@ -1,0 +1,964 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from functools import cached_property
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack, final
+
+import pulumi
+from pulumi import Input, Output
+from pulumi_aws import cloudwatch
+from pulumi_aws.apigateway import Authorizer as PulumiAuthorizer
+from pulumi_aws.apigateway import (
+    BasePathMapping,
+    Deployment,
+    DomainName,
+    Integration,
+    Method,
+    Resource,
+    Stage,
+)
+from pulumi_aws.apigateway import (
+    RestApi as PulumiRestApi,
+)
+from pulumi_aws.lambda_ import Permission
+
+from stelvio import context
+from stelvio.aws.acm import AcmValidatedDomain
+from stelvio.aws.api_gateway.domain import build_url, execute_api_host
+from stelvio.aws.api_gateway.iam import _create_api_gateway_account_and_role
+from stelvio.aws.api_gateway.rest_api.config import (
+    RestApiConfig,
+    RestApiConfigDict,
+    _ApiRoute,
+    _Authorizer,
+    path_to_resource_name,
+)
+from stelvio.aws.api_gateway.rest_api.constants import (
+    DEFAULT_ENDPOINT_TYPE,
+    DEFAULT_STAGE_NAME,
+    ApiEndpointType,
+    HTTPMethodInput,
+)
+from stelvio.aws.api_gateway.rest_api.cors import (
+    cors_env_vars,
+    create_cors_gateway_responses,
+    create_cors_options_methods,
+)
+from stelvio.aws.api_gateway.rest_api.deployment import (
+    _calculate_deployment_hash,
+    _get_handler_key_for_trigger,
+)
+from stelvio.aws.api_gateway.routing import (
+    fn_name_from_key,
+    get_group_config_map,
+    group_routes_by_handler,
+)
+from stelvio.aws.api_gateway.validators import (
+    PERMISSION_NAME_MAX_LENGTH,
+    log_retention_in_days,
+)
+from stelvio.aws.cognito.user_pool import UserPool
+from stelvio.aws.function import Function, FunctionConfig, FunctionConfigDict, resolve_handler
+from stelvio.aws.function.function import FunctionEnvVarsRegistry
+from stelvio.aws.permission import AwsPermission
+from stelvio.component import (
+    Component,
+    child_label,
+    link_config_creator,
+    parse_config,
+    resource_name,
+)
+from stelvio.dns import DnsProviderNotConfiguredError
+from stelvio.link import LinkableMixin, LinkConfig
+from stelvio.provider import ProviderStore, aws_region_of
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from pulumi_aws.apigateway import (
+        BasePathMappingArgs,
+        DeploymentArgs,
+        DomainNameArgs,
+        RestApiArgs,
+        StageArgs,
+    )
+
+    from stelvio.aws.acm import AcmValidatedDomainCustomizationDict
+    from stelvio.customize import ChildCustomization, Customization, CustomizationNoArgs
+
+
+@final
+@dataclass(frozen=True)
+class RestApiResources:
+    rest_api: PulumiRestApi
+    deployment: Deployment
+    stage: Stage
+    log_group: cloudwatch.LogGroup
+    custom_domain: DomainName | None = None
+    base_path_mapping: BasePathMapping | None = None
+
+
+class RestApiCustomizationDict(TypedDict, total=False):
+    rest_api: Customization[RestApiArgs]
+    deployment: Customization[DeploymentArgs]
+    stage: Customization[StageArgs]
+    custom_domain: Customization[DomainNameArgs]
+    acm_validated_domain: ChildCustomization[AcmValidatedDomainCustomizationDict]
+    domain_record: CustomizationNoArgs
+    base_path_mapping: Customization[BasePathMappingArgs]
+    log_group: Customization[cloudwatch.LogGroupArgs]
+
+
+@final
+class RestApi(Component[RestApiResources, RestApiCustomizationDict], LinkableMixin):
+    _routes: list[_ApiRoute]
+    _config: RestApiConfig
+    _authorizers: list[_Authorizer]
+    _default_auth: _Authorizer | Literal["IAM"] | None
+    _cors_env_vars: dict[str, str]
+
+    def __init__(
+        self,
+        name: str,
+        config: RestApiConfig | None = None,
+        *,
+        tags: dict[str, str] | None = None,
+        customize: RestApiCustomizationDict | None = None,
+        **opts: Unpack[RestApiConfigDict],
+    ) -> None:
+        super().__init__(
+            ProviderStore.aws(), "stelvio:aws:RestApi", name, tags=tags, customize=customize
+        )
+        self._routes = []
+        self._authorizers = []
+        self._default_auth = None
+        self._config = parse_config(RestApiConfig, config, opts)
+        self._validate_cors_for_rest_api()
+        self._cors_env_vars = cors_env_vars(self._config.normalized_cors)
+
+    def _validate_cors_for_rest_api(self) -> None:
+        """Validate CORS configuration for REST API v1 limitations.
+
+        REST API v1 only supports single origin (string) due to static OPTIONS methods
+        and gateway responses. Multiple origins require HTTP API v2's native CORS support.
+        """
+        cors_config = self._config.normalized_cors
+        if cors_config and isinstance(cors_config.allow_origins, list):
+            raise ValueError(
+                "REST API v1 only supports single origin string for allow_origins. "
+                f"Got list: {cors_config.allow_origins}. Use a single origin like "
+                "'https://example.com' or '*' for all origins."
+            )
+
+    @property
+    def config(self) -> RestApiConfig:
+        return self._config
+
+    @property
+    def domain_name(self) -> str | None:
+        return self._config.domain_name
+
+    @cached_property
+    def _api_resource(self) -> PulumiRestApi:
+        # Created early so `url` and links resolve before `.resources`: a Function routed
+        # on this API can `links=[api]` without recursing into the API's own creation.
+        endpoint_type = self._config.endpoint_type
+        return PulumiRestApi(
+            context().prefix(self.name),
+            **self._customizer(
+                "rest_api",
+                {
+                    "endpoint_configuration": {"types": endpoint_type.upper()}
+                    if endpoint_type
+                    else None
+                },
+                {"endpoint_configuration": {"types": DEFAULT_ENDPOINT_TYPE.upper()}},
+                inject_tags=True,
+            ),
+            opts=self._resource_opts(),
+        )
+
+    @property
+    def url(self) -> Output[str]:
+        if self.domain_name is not None:
+            return build_url("https", self.domain_name, self._config.base_path)
+        return self._execute_api_url()
+
+    def _execute_api_url(self) -> Output[str]:
+        # Built from the api id, not `stage.invoke_url`, so reading url never creates the
+        # Stage. The name comes from config, not the stage customizer: a stage callable expects
+        # every prop, not just the name. A stage renamed through customize is not followed.
+        stage_name = self._config.stage_name or DEFAULT_STAGE_NAME
+        region = aws_region_of(self)
+        return self._api_resource.id.apply(
+            lambda api_id: f"https://{execute_api_host(api_id, region)}/{stage_name}"
+        )
+
+    @property
+    def api_id(self) -> Output[str]:
+        return self.resources.rest_api.id
+
+    @property
+    def arn(self) -> Output[str]:
+        return self.resources.rest_api.arn
+
+    @property
+    def execution_arn(self) -> Output[str]:
+        return self.resources.rest_api.execution_arn
+
+    def _validate_authorizer_name(self, name: str) -> None:
+        """Validate that authorizer name is unique within this API."""
+        if any(auth.name == name for auth in self._authorizers):
+            raise ValueError(
+                f"Duplicate authorizer name: '{name}'. "
+                f"Authorizer names must be unique within an API."
+            )
+
+    def _create_authorizer_permission(
+        self,
+        auth_name: str,
+        function: Function,
+        rest_api: PulumiRestApi,
+        authorizer: PulumiAuthorizer,
+    ) -> Permission:
+        """Create Lambda permission for API Gateway to invoke authorizer function.
+
+        This is created once per authorizer (TOKEN and REQUEST types only).
+        """
+        return Permission(
+            resource_name(f"{self.name}-authorizer-{auth_name}-permission", limit=128),
+            action="lambda:InvokeFunction",
+            function=function.function_name,
+            principal="apigateway.amazonaws.com",
+            source_arn=pulumi.Output.all(rest_api.execution_arn, authorizer.id).apply(
+                lambda args: f"{args[0]}/authorizers/{args[1]}"
+            ),
+            opts=self._resource_opts(),
+        )
+
+    def add_token_authorizer(
+        self,
+        name: str,
+        handler: str | FunctionConfig | FunctionConfigDict | Function,
+        /,
+        *,
+        identity_source: str = "method.request.header.Authorization",
+        ttl: int = 300,
+        **function_config: Unpack[FunctionConfigDict],
+    ) -> _Authorizer:
+        """Add a TOKEN authorizer (bearer token auth - JWT, OAuth).
+
+        Args:
+            name: Authorizer name
+            handler: Handler path, FunctionConfig, config dict, or Function instance
+            identity_source: Header to extract token from (default: Authorization)
+            ttl: Cache TTL in seconds (default: 300)
+            **function_config: Function configuration (memory, timeout, links, etc.);
+                handler path only
+
+        Returns:
+            _Authorizer instance to use in route() calls
+        """
+        self._check_not_created("routes and authorizers")
+        self._validate_authorizer_name(name)
+
+        resolved = resolve_handler(handler, function_config)
+        function = (
+            resolved
+            if isinstance(resolved, Function)
+            else Function(f"{self.name}-auth-{name}", resolved, tags=self.tags, parent=self)
+        )
+
+        authorizer = _Authorizer(
+            name=name,
+            token_function=function,
+            identity_source=identity_source,
+            ttl=ttl,
+            handler_key=_get_handler_key_for_trigger(resolved),
+        )
+        self._authorizers.append(authorizer)
+        return authorizer
+
+    def add_request_authorizer(
+        self,
+        name: str,
+        handler: str | FunctionConfig | FunctionConfigDict | Function,
+        /,
+        *,
+        identity_source: str | list[str] = "method.request.header.Authorization",
+        ttl: int = 300,
+        **function_config: Unpack[FunctionConfigDict],
+    ) -> _Authorizer:
+        """Add a REQUEST authorizer (multi-source auth, full request context).
+
+        Args:
+            name: Authorizer name
+            handler: Handler path, FunctionConfig, config dict, or Function instance
+            identity_source: Source(s) for auth data (header, query param, etc.).
+                Can be a single source string or list of sources.
+                Defaults to "method.request.header.Authorization"
+            ttl: Cache TTL in seconds (default: 300)
+            **function_config: Function configuration (memory, timeout, links, etc.);
+                handler path only
+
+        Returns:
+            _Authorizer instance to use in route() calls
+        """
+        self._check_not_created("routes and authorizers")
+        self._validate_authorizer_name(name)
+
+        resolved = resolve_handler(handler, function_config)
+        function = (
+            resolved
+            if isinstance(resolved, Function)
+            else Function(f"{self.name}-auth-{name}", resolved, tags=self.tags, parent=self)
+        )
+
+        # Normalize identity_source to list[str]
+        normalized_sources = (
+            [identity_source] if isinstance(identity_source, str) else identity_source
+        )
+
+        authorizer = _Authorizer(
+            name=name,
+            request_function=function,
+            identity_source=normalized_sources,
+            ttl=ttl,
+            handler_key=_get_handler_key_for_trigger(resolved),
+        )
+        self._authorizers.append(authorizer)
+        return authorizer
+
+    def add_cognito_authorizer(
+        self, name: str, /, *, user_pools: list[UserPool | str], ttl: int = 300
+    ) -> _Authorizer:
+        """Add a Cognito User Pool authorizer.
+
+        Args:
+            name: Authorizer name
+            user_pools: List of Cognito User Pool ARNs or UserPool components
+            ttl: Cache TTL in seconds (default: 300)
+
+        Returns:
+            _Authorizer instance to use in route() calls
+        """
+        self._check_not_created("routes and authorizers")
+        self._validate_authorizer_name(name)
+
+        resolved = [pool.arn if isinstance(pool, UserPool) else pool for pool in user_pools]
+        authorizer = _Authorizer(name=name, user_pools=resolved, ttl=ttl)
+        self._authorizers.append(authorizer)
+        return authorizer
+
+    @property
+    def default_auth(self) -> _Authorizer | Literal["IAM"] | None:
+        """Get default authorization for all routes."""
+        return self._default_auth
+
+    @default_auth.setter
+    def default_auth(self, auth: _Authorizer | Literal["IAM"] | None) -> None:
+        """Set default authorization for all routes.
+
+        Routes without explicit auth parameter will use this default.
+        Routes can opt out with auth=False.
+
+        Args:
+            auth: Default authorizer, "IAM" for AWS IAM auth, or None for no default
+        """
+        self._check_not_created("routes and authorizers")
+        self._default_auth = auth
+
+    def route(
+        self,
+        http_method: HTTPMethodInput,
+        path: str,
+        handler: str | FunctionConfig | FunctionConfigDict | Function | None = None,
+        /,
+        *,
+        auth: _Authorizer | Literal["IAM", False] | None = None,
+        cognito_scopes: list[str] | None = None,
+        **opts: Unpack[FunctionConfigDict],
+    ) -> None:
+        """Add a route to the API.
+
+        The route handler can be specified in three ways:
+        1. As a complete configuration object (FunctionConfig, FunctionConfigDict, or Function)
+        2. As a handler path string with optional FunctionConfigDict fields as kwargs
+        3. As FunctionConfigDict fields passed directly as keyword arguments
+
+        Args:
+            http_method: HTTP method(s) to handle. Can be:
+                - String ("GET", "POST", etc.)
+                - HTTPMethod enum value
+                - List of methods for multiple method support
+                - "ANY" or "*" to handle all methods
+            path: URL path for the route
+            handler: Route handler specification. Can be:
+                - Function handler path as string
+                - Complete FunctionConfig object
+                - FunctionConfigDict dictionary
+                - Function instance
+                - None (if handler is specified in opts)
+            auth: Authorization for this route:
+                - _Authorizer instance (from add_*_authorizer methods)
+                - "IAM" for AWS IAM authentication
+                - False to explicitly make route public (override default)
+                - None to use default auth if set, otherwise public
+            cognito_scopes: OAuth 2.0 scopes for Cognito authorization. Only works with
+                Cognito authorizers. The token must contain at least ONE of the specified scopes.
+                API Gateway returns 403 if the required scope is missing.
+            **opts: Additional FunctionConfigDict fields when using handler path
+
+        Raises:
+            ValueError: If the configuration is ambiguous or incomplete
+            TypeError: If handler is of invalid type
+            ValueError: If a route with the same path and method already exists
+            ValueError: If cognito_scopes is used with non-Cognito authorizer
+
+        Examples:
+            # Single method
+            api.route("GET", "/users", "users.index", memory=128)
+            api.route(HTTPMethod.GET, "/users", "users.index")
+
+            # With authorization
+            auth = api.add_token_authorizer("jwt", "auth/jwt.handler")
+            api.route("GET", "/users", "users.index", auth=auth)
+            api.route("POST", "/admin", "admin.handler", auth="IAM")
+            api.route("GET", "/health", "health.check", auth=False)
+
+            # With Cognito scopes
+            cognito_auth = api.add_cognito_authorizer("cognito", user_pools=[pool_arn])
+            api.route("POST", "/admin/users", "admin.create_user",
+                     auth=cognito_auth, cognito_scopes=["admin", "users:write"])
+
+            # Multiple methods
+            api.route(["GET", "POST"], "/users", "users.handle")
+
+            # All methods
+            api.route("ANY", "/users", "users.handle")
+
+            # Configuration examples
+            api.route("GET", "/users", {"handler": "users.index", "memory": 128})
+            api.route("GET", "/users", handler="users.index", memory=128)
+
+        """
+        self._check_not_created("routes and authorizers")
+
+        resolved = resolve_handler(handler, opts)
+        api_route = _ApiRoute(
+            http_method, path, resolved, auth=auth, cognito_scopes=cognito_scopes
+        )
+
+        # Check for duplicate routes
+        for method in api_route.methods:
+            for existing_route in self._routes:
+                # Skip routes with different paths
+                if api_route.path != existing_route.path:
+                    continue
+                if (  # Route conflict occurs when:
+                    method in existing_route.methods  # Direct method match
+                    or method in ("ANY", "*")  # Current route uses ANY
+                    or any(
+                        m in ("ANY", "*") for m in existing_route.methods
+                    )  # Existing route uses ANY
+                ):
+                    raise ValueError(
+                        f"Route conflict: {method} {path} conflicts with existing route."
+                    )
+
+        # A user-passed Function may be built before this API is (drive() walks the registry
+        # by type), so its CORS env vars go in now; API-created Functions get theirs in
+        # get_group_function, still before their own build.
+        if isinstance(resolved, Function):
+            FunctionEnvVarsRegistry.add(resolved, self._cors_env_vars)
+        self._routes.append(api_route)
+
+    def get_or_create_resource(
+        self, path_parts: list[str], resources: dict[str, Resource], rest_api: PulumiRestApi
+    ) -> Output[str]:
+        if not path_parts:
+            return rest_api.root_resource_id
+
+        path_key = "/".join(path_parts)
+        if path_key in resources:
+            return resources[path_key].id
+
+        part = path_parts[-1]
+        parent_parts = path_parts[:-1]
+
+        parent_resource_id = self.get_or_create_resource(parent_parts, resources, rest_api)
+        old_name = context().prefix(f"{self.name}-resource-{path_to_resource_name(path_parts)}")
+        resource = Resource(
+            context().prefix(f"{self.name}-resource-/{path_key}"),
+            rest_api=rest_api.id,
+            parent_id=parent_resource_id,
+            path_part=part,
+            opts=self._resource_opts(old_name=old_name),
+        )
+        resources[path_key] = resource
+        return resource.id
+
+    def _create_authorizers(self, rest_api: PulumiRestApi) -> dict[str, PulumiAuthorizer]:
+        """Create Pulumi Authorizer resources from configured authorizers."""
+        authorizer_resources = {}
+
+        for auth in self._authorizers:
+            # Determine authorizer type and build type-specific parameters
+            func = None
+            if auth.token_function is not None:
+                func = auth.token_function
+                type_params = {
+                    "type": "TOKEN",
+                    "authorizer_uri": func.invoke_arn,
+                    "identity_source": auth.identity_source,
+                }
+            elif auth.request_function is not None:
+                func = auth.request_function
+                type_params = {
+                    "type": "REQUEST",
+                    "authorizer_uri": func.invoke_arn,
+                    "identity_source": ",".join(auth.identity_source)
+                    if auth.identity_source
+                    else None,
+                }
+            else:  # auth.user_pools is not None
+                type_params = {
+                    "type": "COGNITO_USER_POOLS",
+                    "provider_arns": auth.user_pools,
+                }
+
+            # Create authorizer with common + type-specific params
+            pulumi_auth = PulumiAuthorizer(
+                resource_name(f"{self.name}-authorizer-{auth.name}", limit=128),
+                rest_api=rest_api.id,
+                name=auth.name,
+                authorizer_result_ttl_in_seconds=auth.ttl,
+                **type_params,
+                opts=self._resource_opts(),
+            )
+
+            # Create Lambda permission for TOKEN and REQUEST authorizers
+            if func is not None:
+                self._create_authorizer_permission(auth.name, func, rest_api, pulumi_auth)
+
+            authorizer_resources[auth.name] = pulumi_auth
+
+        return authorizer_resources
+
+    def _create_deployment(
+        self,
+        api: PulumiRestApi,
+        api_name: str,
+        trigger_hash: Input[str],
+        depends_on: Input[Sequence[Input[Resource]] | Resource] | None = None,
+    ) -> Deployment:
+        """Creates the API deployment, triggering redeployment based on config changes."""
+        return Deployment(
+            context().prefix(f"{api_name}-deployment"),
+            **self._customizer(
+                "deployment",
+                {},
+                {
+                    "rest_api": api.id,
+                    # Trigger new deployment only when API route config changes
+                    "triggers": {"configuration_hash": trigger_hash},
+                },
+            ),
+            # Ensure deployment happens after all resources/methods/integrations are created
+            opts=self._resource_opts(depends_on=depends_on),
+        )
+
+    def _create_resources(self) -> RestApiResources:
+        # This is what needs to be done:
+        #   1. create rest api
+        #   2. for each route:
+        #       a. create resource(s)
+        #       b. create method(s)
+        #       c. create lambda from handler if it doesn't exists (we need to group
+        #           routes based on lambda)
+        #       d. give lambda resource policy so it can be called by given
+        #           gateway/resource/method
+        #           https://docs.aws.amazon.com/lambda/latest/dg/access-control-resource-based.html
+        #       e. create integration between method and lambda
+        #   3. create role for gateway and give it permission to write to cloudwatch
+        #   4. create account and give it a role
+        #   5. create deployment
+        #   6. create stage
+        #   7. create custom domain name if specified
+        #       a. create ACM certificate
+        #           i. request certificate from aws acm
+        #           ii. create validation record in DNS
+        #           iii. wait for validation using `acm.CertificateValidation`
+        #       b. create DNS record for the custom domain name
+        #       c. create base path mapping
+        endpoint_type = self._config.endpoint_type or DEFAULT_ENDPOINT_TYPE
+        rest_api = self._api_resource
+
+        account = _create_api_gateway_account_and_role(self._provider)
+
+        log_group = cloudwatch.LogGroup(
+            context().prefix(f"{self.name}-logs"),
+            **self._customizer(
+                "log_group",
+                {
+                    "retention_in_days": log_retention_in_days(
+                        self._config.access_log_retention_days
+                    )
+                },
+                {
+                    "name": rest_api.name.apply(lambda name: f"/aws/apigateway/{name}"),
+                    "retention_in_days": 30,
+                },
+                inject_tags=True,
+            ),
+            opts=self._resource_opts(),
+        )
+
+        authorizer_resources = self._create_authorizers(rest_api)
+        authorizer_id_map = {name: res.id for name, res in authorizer_resources.items()}
+
+        # Create CORS gateway responses (if CORS enabled)
+        cors_config = self._config.normalized_cors
+        cors_gateway_responses = []
+        if cors_config:
+            cors_gateway_responses = create_cors_gateway_responses(
+                rest_api, cors_config, self.name, opts=self._resource_opts()
+            )
+
+        grouped_routes_by_lambda = group_routes_by_handler(self._routes)
+        group_config_map = get_group_config_map(grouped_routes_by_lambda)
+
+        resources = {}
+
+        # Create all method-integration pairs in a single comprehension
+        method_integration_pairs = [
+            pair
+            for key, group in grouped_routes_by_lambda.items()
+            for pair in self._create_route_resources(
+                group,
+                rest_api,
+                self.get_group_function(key, rest_api, group_config_map[key]),
+                resources,
+                authorizer_id_map,
+            )
+        ]
+
+        # Create CORS OPTIONS methods (if CORS enabled)
+        cors_options_method_tuples = []
+        if cors_config:
+            cors_options_method_tuples = create_cors_options_methods(
+                rest_api,
+                self._routes,
+                cors_config,
+                resources,
+                self.name,
+                resource_opts=self._resource_opts,
+            )
+
+        # Flatten the pairs for deployment dependencies
+        all_deployment_dependencies = [
+            resource for pair in method_integration_pairs for resource in pair
+        ]
+        all_deployment_dependencies.extend(authorizer_resources.values())
+        all_deployment_dependencies.extend(cors_gateway_responses)
+        all_deployment_dependencies.extend(
+            [resource for tuple_ in cors_options_method_tuples for resource in tuple_]
+        )
+
+        trigger_hash = _calculate_deployment_hash(self._routes, self._default_auth, cors_config)
+        deployment = self._create_deployment(
+            rest_api, self.name, trigger_hash, depends_on=all_deployment_dependencies
+        )
+
+        stage_name = self._config.stage_name or DEFAULT_STAGE_NAME
+        stage = Stage(
+            resource_name(f"{self.name}-stage-{stage_name}", limit=128),
+            **self._customizer(
+                "stage",
+                {"stage_name": self._config.stage_name},
+                {
+                    "rest_api": rest_api.id,
+                    "deployment": deployment.id,
+                    "stage_name": DEFAULT_STAGE_NAME,
+                    # xray_tracing_enabled=True,
+                    "access_log_settings": {
+                        "destination_arn": log_group.arn,
+                        "format": '{"requestId":"$context.requestId", "ip": "$context.identity.sourceIp", '  # noqa: E501
+                        '"caller":"$context.identity.caller", "user":"$context.identity.user",'
+                        '"requestTime":"$context.requestTime", "httpMethod":'
+                        '"$context.httpMethod","resourcePath":"$context.resourcePath", '
+                        '"status":"$context.status","protocol":"$context.protocol", '
+                        '"responseLength":"$context.responseLength"}',
+                    },
+                },
+                inject_tags=True,
+            ),
+            opts=self._resource_opts(depends_on=[account, log_group]),
+        )
+
+        aws_custom_domain_name = None
+        base_path_mapping = None
+
+        if self.domain_name is not None:
+            aws_custom_domain_name, base_path_mapping = self._create_custom_domain(
+                self.domain_name, rest_api, stage, endpoint_type
+            )
+
+        self.register_outputs({"url": self.url})
+
+        return RestApiResources(
+            rest_api,
+            deployment,
+            stage,
+            log_group,
+            custom_domain=aws_custom_domain_name,
+            base_path_mapping=base_path_mapping,
+        )
+
+    def _create_method_and_integration(  # noqa: PLR0913
+        self,
+        route: _ApiRoute,
+        http_method: str,
+        resource_id: Output[str],
+        rest_api: PulumiRestApi,
+        function: Function,
+        authorizer_id_map: dict[str, Output[str]],
+    ) -> tuple[Method, Integration]:
+        # Determine authorization type and authorizer ID
+        auth = route.auth if route.auth is not None else self._default_auth
+
+        if auth is False or auth is None:
+            authorization_type = "NONE"
+            authorizer_id = None
+        elif auth == "IAM":
+            authorization_type = "AWS_IAM"
+            authorizer_id = None
+        elif isinstance(auth, _Authorizer):
+            authorization_type = "COGNITO_USER_POOLS" if auth.user_pools is not None else "CUSTOM"
+            authorizer_id = authorizer_id_map.get(auth.name)
+            if authorizer_id is None:
+                raise ValueError(
+                    f"Authorizer '{auth.name}' not found in authorizer map. "
+                    "This should not happen - please report this as a bug."
+                )
+        else:
+            raise ValueError(
+                f"Invalid auth value: {auth!r} (type: {type(auth).__name__}). Expected "
+                f"_Authorizer instance (from add_*_authorizer methods), 'IAM', False, or None."
+            )
+
+        legacy_path = path_to_resource_name(route.path_parts)
+        old_method_name = context().prefix(f"{self.name}-method-{http_method}-{legacy_path}")
+        method = Method(
+            context().prefix(f"{self.name}-method-{http_method} {route.path}"),
+            rest_api=rest_api.id,
+            resource_id=resource_id,
+            http_method=http_method,
+            authorization=authorization_type,
+            authorizer_id=authorizer_id,
+            authorization_scopes=route.cognito_scopes,
+            opts=self._resource_opts(old_name=old_method_name),
+        )
+
+        # Integration must wait for Method to be created in AWS.
+        # By referencing method.http_method (an Output), we create an implicit dependency.
+        # This ensures correct ordering: Resource → Authorizer → Method → Integration
+        # Without this, Integration could try to create before Method exists, causing 404.
+        old_integration_name = context().prefix(
+            f"{self.name}-integration-{http_method}-{legacy_path}"
+        )
+        integration = Integration(
+            context().prefix(f"{self.name}-integration-{http_method} {route.path}"),
+            rest_api=rest_api.id,
+            resource_id=resource_id,
+            http_method=method.http_method,  # Output reference creates dependency
+            integration_http_method="POST",
+            type="AWS_PROXY",
+            uri=function.invoke_arn,
+            opts=self._resource_opts(old_name=old_integration_name),
+        )
+
+        return method, integration
+
+    def _create_route_resources(
+        self,
+        routes: list[_ApiRoute],
+        rest_api: PulumiRestApi,
+        function: Function,
+        resources: dict[str, Resource],
+        authorizer_id_map: dict[str, Output[str]],
+    ) -> list[tuple[Method, Integration]]:
+        return [
+            # Create method and integration for each route and HTTP method
+            self._create_method_and_integration(
+                route,
+                http_method,
+                self.get_or_create_resource(route.path_parts, resources, rest_api),
+                rest_api,
+                function,
+                authorizer_id_map,
+            )
+            # For each route and HTTP method
+            for route in routes
+            for http_method in route.methods
+        ]
+
+    def get_group_function(
+        self, key: str, rest_api: PulumiRestApi, route_with_config: _ApiRoute
+    ) -> Function:
+        if isinstance(route_with_config.handler, Function):
+            function = route_with_config.handler  # route() registered its CORS env vars
+        else:
+            function_config = route_with_config.handler
+            # Function name prefixed with API name to avoid collisions across APIs.
+            # Routes with same handler string share one Lambda (if within same API).
+            function = Function(
+                fn_name_from_key(self.name, key), function_config, tags=self.tags, parent=self
+            )
+            FunctionEnvVarsRegistry.add(function, self._cors_env_vars)
+
+        # Named after the API too: one Function routed from two APIs needs two permissions.
+        Permission(
+            resource_name(
+                f"{self.name}-permission-{function.name}", limit=PERMISSION_NAME_MAX_LENGTH
+            ),
+            action="lambda:InvokeFunction",
+            function=function.function_name,
+            principal="apigateway.amazonaws.com",
+            source_arn=rest_api.execution_arn.apply(lambda arn: f"{arn}/*/*"),
+            opts=self._resource_opts(),
+        )
+        return function
+
+    def _create_custom_domain(
+        self,
+        domain_name: str,
+        rest_api: PulumiRestApi,
+        stage: Stage,
+        endpoint_type: ApiEndpointType = "regional",
+    ) -> tuple[DomainName, BasePathMapping]:
+        """Create custom domain with ACM certificate, DNS records, and base path mapping."""
+        if not isinstance(domain_name, str):
+            raise TypeError("Domain name must be a string")
+        if not domain_name:
+            raise ValueError("Domain name cannot be empty")
+
+        dns = context().dns
+
+        if dns is None:
+            raise DnsProviderNotConfiguredError(
+                "DNS provider is not configured in the context. "
+                "Please set up a DNS provider to use custom domains."
+            )
+
+        is_edge = endpoint_type == "edge"
+
+        # 1-3 - Create the ACM certificate and validation record
+        # Edge endpoints use CloudFront internally, so ACM certificates must be in us-east-1
+        acm_validated_domain = AcmValidatedDomain(
+            f"{self.name}-acm-custom-domain",
+            domain_name=domain_name,
+            tags=self.tags,
+            customize=self._customize.get("acm_validated_domain"),
+            region="us-east-1" if is_edge else None,
+            parent=self,
+        )
+
+        # 4 - Create the custom domain name in API Gateway
+        user_endpoint_type = self._config.endpoint_type
+        certificate_key = "certificate_arn" if is_edge else "regional_certificate_arn"
+        aws_custom_domain_name = DomainName(
+            context().prefix(f"{self.name}-custom-domain"),
+            **self._customizer(
+                "custom_domain",
+                {
+                    "domain_name": domain_name,
+                    "endpoint_configuration": {"types": user_endpoint_type.upper()}
+                    if user_endpoint_type
+                    else None,
+                },
+                {
+                    "endpoint_configuration": {"types": DEFAULT_ENDPOINT_TYPE.upper()},
+                    certificate_key: acm_validated_domain.resources.certificate.arn,
+                },
+                inject_tags=True,
+            ),
+            opts=pulumi.ResourceOptions.merge(
+                self._resource_opts(),
+                pulumi.ResourceOptions(
+                    depends_on=[acm_validated_domain.resources.cert_validation]
+                ),
+            ),
+        )
+
+        # 5 - DNS record creation for the API Gateway custom domain with DNS PROVIDER
+        dns_target = (
+            aws_custom_domain_name.cloudfront_domain_name
+            if is_edge
+            else aws_custom_domain_name.regional_domain_name
+        )
+        api_record = dns.create_record(
+            resource_name=context().prefix(f"{self.name}-custom-domain-record"),
+            name=domain_name,
+            **self._customizer(
+                "domain_record",
+                {},
+                {"record_type": "CNAME", "value": dns_target, "ttl": 1},
+            ),
+            opts=self._resource_opts(),
+        )
+
+        # 6 - Base Path Mapping
+        base_path_mapping = BasePathMapping(
+            context().prefix(f"{self.name}-custom-domain-base-path-mapping"),
+            **self._customizer(
+                "base_path_mapping",
+                {"base_path": self._config.base_path},
+                {
+                    "rest_api": rest_api.id,
+                    "stage_name": stage.stage_name,
+                    "domain_name": aws_custom_domain_name.domain_name,
+                },
+            ),
+            opts=pulumi.ResourceOptions.merge(
+                self._resource_opts(),
+                pulumi.ResourceOptions(
+                    depends_on=[stage, api_record.pulumi_resource, aws_custom_domain_name]
+                ),
+            ),
+        )
+
+        return aws_custom_domain_name, base_path_mapping
+
+
+@link_config_creator(RestApi)
+def _rest_api_link_creator(rest_api: RestApi) -> LinkConfig:
+    execution_arn = rest_api._api_resource.execution_arn  # noqa: SLF001
+    return LinkConfig(
+        properties={"api_url": rest_api.url, "api_execution_arn": execution_arn},
+        permissions=[
+            # Every stage, method and path, so a linked Lambda can call `auth="IAM"` routes.
+            AwsPermission(
+                actions=["execute-api:Invoke"], resources=[Output.concat(execution_arn, "/*")]
+            )
+        ],
+    )
+
+
+_KIND_PREFIX = re.compile(
+    r"^(?:(?:method|integration)(?:-response)?|resource|authorizer|permission)-"
+)
+
+
+@child_label("RestApi")
+def _rest_api_child_label(name: str) -> str:
+    """`method-GET /users/{id}` -> `GET /users/{id}`, `permission-orders` -> `orders`,
+    `authorizer-jwt-permission` -> `jwt`.
+
+    The type label already says method, resource or permission. Only authorizer permission
+    names end in `-permission`, but a path could too (`GET /x-permission`), so names with a
+    `/` keep it.
+    """
+    name = _KIND_PREFIX.sub("", name)
+    return name if "/" in name else name.removesuffix("-permission")

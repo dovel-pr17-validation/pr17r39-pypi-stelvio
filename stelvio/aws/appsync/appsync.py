@@ -1,0 +1,683 @@
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any, Unpack, final
+
+from pulumi import Output
+from pulumi_aws import appsync, lambda_
+
+from stelvio import context
+from stelvio.aws import acm
+from stelvio.aws.api_gateway.validators import url_domain
+from stelvio.aws.appsync.config import (
+    ApiKeyAuth,
+    AppSyncConfig,
+    AppSyncConfigDict,
+    AppSyncCustomizationDict,
+    AppSyncDataSourceCustomizationDict,
+    AppSyncPipeFunctionCustomizationDict,
+    AppSyncResolverCustomizationDict,
+    AuthConfig,
+    CognitoAuth,
+    LambdaAuth,
+    OidcAuth,
+    _auth_type_string,
+)
+from stelvio.aws.appsync.constants import (
+    DS_TYPE_DYNAMO,
+    DS_TYPE_HTTP,
+    DS_TYPE_LAMBDA,
+    DS_TYPE_NONE,
+    DS_TYPE_OPENSEARCH,
+    DS_TYPE_RDS,
+)
+from stelvio.aws.appsync.data_source import (
+    AppSyncDataSource,
+    AppSyncDataSourceTypeConfig,
+    AppSyncRdsSourceConfig,
+    _opensearch_arn_from_endpoint,
+)
+from stelvio.aws.appsync.file_inputs import read_schema_input
+from stelvio.aws.appsync.resolver import AppSyncResolver, AppsyncResolverConfig, PipeFunction
+from stelvio.aws.dynamo_db import DynamoTable
+from stelvio.aws.function import (
+    Function,
+    FunctionConfig,
+    FunctionConfigDict,
+    resolve_handler,
+)
+from stelvio.aws.permission import AwsPermission
+from stelvio.component import Component, link_config_creator, parse_config, resource_name
+from stelvio.dns import DnsProviderNotConfiguredError, Record
+from stelvio.link import LinkableMixin, LinkConfig
+from stelvio.provider import ProviderStore
+
+_DS_TYPES_REQUIRING_CODE = {DS_TYPE_DYNAMO, DS_TYPE_HTTP, DS_TYPE_RDS, DS_TYPE_OPENSEARCH}
+
+
+def _build_additional_auth_provider(
+    auth: AuthConfig, *, lambda_authorizer_arn: Output[str] | None = None
+) -> dict[str, Any]:
+    provider: dict[str, Any] = {"authentication_type": _auth_type_string(auth)}
+
+    if isinstance(auth, CognitoAuth):
+        provider["user_pool_config"] = auth.to_provider_config()
+    elif isinstance(auth, OidcAuth):
+        provider["openid_connect_config"] = auth.to_provider_config()
+    elif isinstance(auth, LambdaAuth):
+        if lambda_authorizer_arn is None:
+            raise ValueError("Missing lambda authorizer ARN for LambdaAuth provider")
+        provider["lambda_authorizer_config"] = auth.to_authorizer_config(lambda_authorizer_arn)
+
+    return provider
+
+
+@final
+@dataclass(frozen=True)
+class AppSyncResources:
+    api: appsync.GraphQLApi
+    api_key: appsync.ApiKey | None
+    none_data_source: appsync.DataSource
+    auth_permissions: list[lambda_.Permission] | None = None
+    acm_validated_domain: acm.AcmValidatedDomain | None = None
+    domain_association: appsync.DomainNameApiAssociation | None = None
+    domain_dns_record: Record | None = None
+
+
+@final
+class AppSync(Component[AppSyncResources, AppSyncCustomizationDict], LinkableMixin):
+    def __init__(
+        self,
+        name: str,
+        config: AppSyncConfig | AppSyncConfigDict | None = None,
+        *,
+        tags: dict[str, str] | None = None,
+        customize: AppSyncCustomizationDict | None = None,
+        **opts: Unpack[AppSyncConfigDict],
+    ) -> None:
+        super().__init__(
+            ProviderStore.aws(), "stelvio:aws:AppSync", name, tags=tags, customize=customize
+        )
+
+        self._config = parse_config(AppSyncConfig, config, opts)
+        self._schema = read_schema_input(self._config.schema)
+
+        self._data_sources: dict[str, AppSyncDataSource] = {}
+        self._resolvers: list[AppSyncResolver] = []
+        self._resolver_keys: set[tuple[str, str]] = set()
+        self._pipe_functions: dict[str, PipeFunction] = {}
+
+    @property
+    def config(self) -> AppSyncConfig:
+        return self._config
+
+    @property
+    def none_data_source(self) -> appsync.DataSource:
+        return self.resources.none_data_source
+
+    @property
+    def domain_name(self) -> str | None:
+        return self._config.domain_name
+
+    @property
+    def url(self) -> Output[str]:
+        return self._url()
+
+    def _url(self, api: appsync.GraphQLApi | None = None) -> Output[str]:
+        # A custom domain url needs no resource, so an authorizer function can put it in its
+        # environment while the api is being created. _create_resources passes the api: it
+        # registers the url before self.resources is set.
+        if domain := url_domain(self._config.domain_name):
+            return Output.concat("https://", domain, "/graphql")
+        return (api or self.resources.api).uris["GRAPHQL"]
+
+    @property
+    def arn(self) -> Output[str]:
+        return self.resources.api.arn
+
+    @property
+    def api_id(self) -> Output[str]:
+        return self.resources.api.id
+
+    @property
+    def api_key(self) -> Output[str] | None:
+        if self.resources.api_key is None:
+            return None
+        return self.resources.api_key.key
+
+    def data_source_lambda(
+        self,
+        name: str,
+        handler: str | FunctionConfig | FunctionConfigDict | Function,
+        *,
+        customize: AppSyncDataSourceCustomizationDict | None = None,
+        **fn_opts: Unpack[FunctionConfigDict],
+    ) -> AppSyncDataSource:
+        self._validate_data_source_name(name)
+
+        function_handler = resolve_handler(handler, fn_opts)
+
+        data_source = AppSyncDataSource(
+            name,
+            api=self,
+            config=AppSyncDataSourceTypeConfig(ds_type=DS_TYPE_LAMBDA, handler=function_handler),
+            tags=self.tags,
+            customize=customize,
+            parent=self,
+        )
+        self._data_sources[name] = data_source
+        return data_source
+
+    def data_source_dynamo(
+        self,
+        name: str,
+        *,
+        table: DynamoTable,
+        customize: AppSyncDataSourceCustomizationDict | None = None,
+    ) -> AppSyncDataSource:
+        self._validate_data_source_name(name)
+
+        if not isinstance(table, DynamoTable):
+            raise TypeError(
+                "table must be a DynamoTable component instance created with "
+                "stelvio.aws.dynamo_db.DynamoTable"
+            )
+
+        data_source = AppSyncDataSource(
+            name,
+            api=self,
+            config=AppSyncDataSourceTypeConfig(ds_type=DS_TYPE_DYNAMO, table=table),
+            tags=self.tags,
+            customize=customize,
+            parent=self,
+        )
+        self._data_sources[name] = data_source
+        return data_source
+
+    def data_source_http(
+        self, name: str, *, url: str, customize: AppSyncDataSourceCustomizationDict | None = None
+    ) -> AppSyncDataSource:
+        self._validate_data_source_name(name)
+
+        if not url:
+            raise ValueError("url cannot be empty")
+
+        data_source = AppSyncDataSource(
+            name,
+            api=self,
+            config=AppSyncDataSourceTypeConfig(ds_type=DS_TYPE_HTTP, url=url),
+            tags=self.tags,
+            customize=customize,
+            parent=self,
+        )
+        self._data_sources[name] = data_source
+        return data_source
+
+    def data_source_rds(
+        self,
+        name: str,
+        *,
+        cluster_arn: str,
+        secret_arn: str,
+        database: str,
+        customize: AppSyncDataSourceCustomizationDict | None = None,
+    ) -> AppSyncDataSource:
+        self._validate_data_source_name(name)
+
+        if not cluster_arn:
+            raise ValueError("cluster_arn cannot be empty")
+        if not secret_arn:
+            raise ValueError("secret_arn cannot be empty")
+        if not database:
+            raise ValueError("database cannot be empty")
+
+        data_source = AppSyncDataSource(
+            name,
+            api=self,
+            config=AppSyncDataSourceTypeConfig(
+                ds_type=DS_TYPE_RDS,
+                rds=AppSyncRdsSourceConfig(
+                    cluster_arn=cluster_arn,
+                    secret_arn=secret_arn,
+                    database=database,
+                ),
+            ),
+            tags=self.tags,
+            customize=customize,
+            parent=self,
+        )
+        self._data_sources[name] = data_source
+        return data_source
+
+    def data_source_opensearch(
+        self,
+        name: str,
+        *,
+        endpoint: str,
+        customize: AppSyncDataSourceCustomizationDict | None = None,
+    ) -> AppSyncDataSource:
+        self._validate_data_source_name(name)
+
+        if not endpoint:
+            raise ValueError("endpoint cannot be empty")
+        _opensearch_arn_from_endpoint(endpoint)
+
+        data_source = AppSyncDataSource(
+            name,
+            api=self,
+            config=AppSyncDataSourceTypeConfig(ds_type=DS_TYPE_OPENSEARCH, endpoint=endpoint),
+            tags=self.tags,
+            customize=customize,
+            parent=self,
+        )
+        self._data_sources[name] = data_source
+        return data_source
+
+    def query(
+        self,
+        field: str,
+        data_source: AppSyncDataSource | list[PipeFunction] | None,
+        *,
+        code: str | None = None,
+        customize: AppSyncResolverCustomizationDict | None = None,
+    ) -> AppSyncResolver:
+        return self._add_resolver("Query", field, data_source, code=code, customize=customize)
+
+    def mutation(
+        self,
+        field: str,
+        data_source: AppSyncDataSource | list[PipeFunction] | None,
+        *,
+        code: str | None = None,
+        customize: AppSyncResolverCustomizationDict | None = None,
+    ) -> AppSyncResolver:
+        return self._add_resolver("Mutation", field, data_source, code=code, customize=customize)
+
+    def subscription(
+        self,
+        field: str,
+        data_source: AppSyncDataSource | list[PipeFunction] | None,
+        *,
+        code: str | None = None,
+        customize: AppSyncResolverCustomizationDict | None = None,
+    ) -> AppSyncResolver:
+        return self._add_resolver(
+            "Subscription", field, data_source, code=code, customize=customize
+        )
+
+    def resolver(
+        self,
+        type_name: str,
+        field: str,
+        data_source: AppSyncDataSource | list[PipeFunction] | None,
+        *,
+        code: str | None = None,
+        customize: AppSyncResolverCustomizationDict | None = None,
+    ) -> AppSyncResolver:
+        return self._add_resolver(type_name, field, data_source, code=code, customize=customize)
+
+    def pipe_function(
+        self,
+        name: str,
+        data_source: AppSyncDataSource | None,
+        *,
+        code: str,
+        customize: AppSyncPipeFunctionCustomizationDict | None = None,
+    ) -> PipeFunction:
+        if not name:
+            raise ValueError("Pipe function name cannot be empty")
+        if name in self._pipe_functions:
+            raise ValueError(f"Duplicate pipe function name '{name}' in AppSync '{self.name}'")
+        if not code:
+            raise ValueError("code is required for pipe_function")
+
+        self._validate_ownership(data_source)
+
+        pipe_function = PipeFunction(
+            self, name, data_source, code=code, customize=customize, parent=self
+        )
+        self._pipe_functions[name] = pipe_function
+        return pipe_function
+
+    def _validate_data_source_name(self, name: str) -> None:
+        if not name:
+            raise ValueError("Data source name cannot be empty")
+        if name == "NONE":
+            raise ValueError(
+                "Data source name 'NONE' is reserved for the internal NONE data source. "
+                "Choose a different name."
+            )
+        if name in self._data_sources:
+            raise ValueError(f"Duplicate data source name '{name}' in AppSync '{self.name}'")
+
+    def _validate_ownership(
+        self, data_source: AppSyncDataSource | list[PipeFunction] | None
+    ) -> None:
+        if isinstance(data_source, AppSyncDataSource):
+            if data_source.api is not self:
+                raise ValueError(
+                    f"Data source '{data_source.name}' belongs to "
+                    f"AppSync '{data_source.api_name}', not '{self.name}'. "
+                    "Data sources cannot be shared across AppSync APIs."
+                )
+        elif isinstance(data_source, list):
+            for pipe_function in data_source:
+                if pipe_function.api_name != self.name:
+                    raise ValueError(
+                        f"Pipe function '{pipe_function.name}' belongs to "
+                        f"AppSync '{pipe_function.api_name}', not '{self.name}'. "
+                        "Pipe functions cannot be shared across AppSync APIs."
+                    )
+
+    def _add_resolver(
+        self,
+        type_name: str,
+        field: str,
+        data_source: AppSyncDataSource | list[PipeFunction] | None,
+        *,
+        code: str | None = None,
+        customize: AppSyncResolverCustomizationDict | None = None,
+    ) -> AppSyncResolver:
+        if not type_name:
+            raise ValueError("type_name cannot be empty")
+        if not field:
+            raise ValueError("field cannot be empty")
+
+        if isinstance(data_source, list) and not data_source:
+            raise ValueError(
+                "Pipeline function list cannot be empty. Provide at least one PipeFunction."
+            )
+
+        if isinstance(data_source, list):
+            for item in data_source:
+                if not isinstance(item, PipeFunction):
+                    raise TypeError(
+                        "Pipeline function list must contain PipeFunction instances, "
+                        f"got {type(item).__name__}."
+                    )
+
+        self._validate_ownership(data_source)
+
+        resolver_key = (type_name, field)
+        if resolver_key in self._resolver_keys:
+            raise ValueError(
+                f"Duplicate resolver for {type_name}.{field} in AppSync '{self.name}'"
+            )
+
+        if (
+            not isinstance(data_source, list)
+            and data_source is not None
+            and data_source.ds_type in _DS_TYPES_REQUIRING_CODE
+            and code is None
+        ):
+            raise ValueError(
+                f"code is required for {data_source.ds_type} data source resolvers. "
+                "Provide APPSYNC_JS code as inline string or .js file path."
+            )
+
+        resolver = AppSyncResolver(
+            self,
+            AppsyncResolverConfig(
+                type_name=type_name,
+                field_name=field,
+                data_source=data_source,
+                code=code,
+            ),
+            customize=customize,
+            parent=self,
+        )
+        self._resolvers.append(resolver)
+        self._resolver_keys.add(resolver_key)
+        return resolver
+
+    def _get_api_key_auth(self) -> ApiKeyAuth | None:
+        if isinstance(self._config.auth, ApiKeyAuth):
+            return self._config.auth
+        for auth in self._config.additional_auth:
+            if isinstance(auth, ApiKeyAuth):
+                return auth
+        return None
+
+    def _create_resources(self) -> AppSyncResources:
+        prefix = context().prefix
+
+        auth_function, additional_auth_functions = self._create_auth_lambdas()
+        api_args = self._build_api_args(auth_function, additional_auth_functions)
+
+        graphql_api = appsync.GraphQLApi(
+            prefix(self.name),
+            **self._customizer("api", api_args, {"name": prefix(self.name)}, inject_tags=True),
+            opts=self._resource_opts(),
+        )
+
+        auth_permissions = self._create_auth_permissions(
+            graphql_api, auth_function, additional_auth_functions
+        )
+        api_key_resource = self._create_api_key(graphql_api)
+
+        none_data_source = appsync.DataSource(
+            resource_name(f"{self.name}-none-ds", limit=128),
+            api_id=graphql_api.id,
+            name="NONE",
+            type=DS_TYPE_NONE,
+            opts=self._resource_opts(),
+        )
+
+        domain_resources = self._create_domain_resources(graphql_api)
+
+        resources = AppSyncResources(
+            api=graphql_api,
+            api_key=api_key_resource,
+            none_data_source=none_data_source,
+            auth_permissions=auth_permissions,
+            **domain_resources,
+        )
+        self.register_outputs({"url": self._url(graphql_api)})
+        return resources
+
+    def _build_api_args(
+        self, auth_function: Function | None, additional_auth_functions: dict[int, Function]
+    ) -> dict[str, Any]:
+        api_args: dict[str, Any] = {
+            "schema": self._schema,
+            "authentication_type": _auth_type_string(self._config.auth),
+        }
+
+        if isinstance(self._config.auth, CognitoAuth):
+            user_pool_config = self._config.auth.to_provider_config()
+            user_pool_config["default_action"] = "ALLOW"
+            api_args["user_pool_config"] = user_pool_config
+        elif isinstance(self._config.auth, OidcAuth):
+            api_args["openid_connect_config"] = self._config.auth.to_provider_config()
+        elif isinstance(self._config.auth, LambdaAuth):
+            if auth_function is None:
+                raise RuntimeError("Primary LambdaAuth function was not created")
+            api_args["lambda_authorizer_config"] = self._config.auth.to_authorizer_config(
+                auth_function.resources.function.arn
+            )
+
+        if self._config.additional_auth:
+            api_args["additional_authentication_providers"] = [
+                _build_additional_auth_provider(
+                    auth,
+                    lambda_authorizer_arn=(
+                        additional_auth_functions[index].resources.function.arn
+                        if index in additional_auth_functions
+                        else None
+                    ),
+                )
+                for index, auth in enumerate(self._config.additional_auth)
+            ]
+
+        return api_args
+
+    def _create_auth_lambdas(self) -> tuple[Function | None, dict[int, Function]]:
+        auth_function: Function | None = None
+        additional_auth_functions: dict[int, Function] = {}
+
+        if isinstance(self._config.auth, LambdaAuth):
+            auth_function = self._create_auth_lambda(self._config.auth)
+
+        for index, auth in enumerate(self._config.additional_auth):
+            if isinstance(auth, LambdaAuth):
+                function = self._create_auth_lambda(auth, suffix=f"-additional-{index}")
+                additional_auth_functions[index] = function
+
+        return auth_function, additional_auth_functions
+
+    def _create_auth_permissions(
+        self,
+        graphql_api: appsync.GraphQLApi,
+        auth_function: Function | None,
+        additional_auth_functions: dict[int, Function],
+    ) -> list[lambda_.Permission]:
+        auth_permissions: list[lambda_.Permission] = []
+
+        if auth_function is not None:
+            permission = lambda_.Permission(
+                resource_name(f"{self.name}-auth-perm", limit=128),
+                **self._customizer(
+                    "auth_permissions",
+                    {},
+                    {
+                        "action": "lambda:InvokeFunction",
+                        "function": auth_function.function_name,
+                        "principal": "appsync.amazonaws.com",
+                        "source_arn": graphql_api.arn,
+                    },
+                ),
+                opts=self._resource_opts(),
+            )
+            auth_permissions.append(permission)
+
+        for index, function in additional_auth_functions.items():
+            permission = lambda_.Permission(
+                resource_name(f"{self.name}-auth-{index}-perm", limit=128),
+                **self._customizer(
+                    "auth_permissions",
+                    {},
+                    {
+                        "action": "lambda:InvokeFunction",
+                        "function": function.function_name,
+                        "principal": "appsync.amazonaws.com",
+                        "source_arn": graphql_api.arn,
+                    },
+                ),
+                opts=self._resource_opts(),
+            )
+            auth_permissions.append(permission)
+
+        return auth_permissions
+
+    def _create_auth_lambda(self, auth: LambdaAuth, suffix: str = "") -> Function:
+        fn_name = f"{self.name}-authorizer{suffix}"
+        resolved = resolve_handler(auth.handler, auth.fn_opts)
+        if isinstance(resolved, Function):
+            return resolved
+        return Function(
+            fn_name,
+            resolved,
+            tags=self.tags,
+            customize=self._customize.get("auth_functions"),
+            parent=self,
+        )
+
+    def _create_api_key(self, graphql_api: appsync.GraphQLApi) -> appsync.ApiKey | None:
+        api_key_auth = self._get_api_key_auth()
+        if api_key_auth is None:
+            return None
+
+        # Compute expiry from "now" so each deploy refreshes to a full validity window
+        # (bounded by ApiKeyAuth validation). This avoids near-expiry replacements during
+        # later updates and keeps rotation timing predictable.
+        expires_dt = datetime.now(tz=UTC) + timedelta(days=api_key_auth.expires)
+        return appsync.ApiKey(
+            resource_name(f"{self.name}-api-key", limit=128),
+            **self._customizer(
+                "api_key",
+                {"expires": expires_dt.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                {"api_id": graphql_api.id},
+            ),
+            opts=self._resource_opts(),
+        )
+
+    def _create_domain_resources(self, graphql_api: appsync.GraphQLApi) -> dict[str, Any]:
+        if self._config.domain_name is None:
+            return {}
+
+        dns = context().dns
+        if dns is None:
+            raise DnsProviderNotConfiguredError(
+                "DNS provider is not configured. "
+                "Please set up a DNS provider to use custom domains."
+            )
+
+        # AppSync custom domains run on CloudFront, whose certificates must be in us-east-1
+        acm_validated_domain = acm.AcmValidatedDomain(
+            f"{self.name}-acm-domain",
+            domain_name=self._config.domain_name,
+            tags=self.tags,
+            customize=self._customize.get("acm_validated_domain"),
+            region="us-east-1",
+            parent=self,
+        )
+
+        domain_name = appsync.DomainName(
+            resource_name(f"{self.name}-domain", limit=128),
+            **self._customizer(
+                "custom_domain",
+                {
+                    "domain_name": self._config.domain_name,
+                },
+                {"certificate_arn": acm_validated_domain.resources.certificate.arn},
+            ),
+            opts=self._resource_opts(depends_on=[acm_validated_domain.resources.cert_validation]),
+        )
+
+        domain_association = appsync.DomainNameApiAssociation(
+            resource_name(f"{self.name}-domain-assoc", limit=128),
+            **self._customizer(
+                "domain_association",
+                {},
+                {
+                    "api_id": graphql_api.id,
+                    "domain_name": domain_name.domain_name,
+                },
+            ),
+            opts=self._resource_opts(),
+        )
+
+        record = dns.create_record(
+            resource_name=resource_name(f"{self.name}-domain-record", limit=255),
+            **self._customizer(
+                "domain_dns_record",
+                {
+                    "name": self._config.domain_name,
+                },
+                default_props={
+                    "record_type": "CNAME",
+                    "value": domain_name.appsync_domain_name,
+                    "ttl": 1,
+                },
+            ),
+            opts=self._resource_opts(),
+        )
+
+        return {
+            "acm_validated_domain": acm_validated_domain,
+            "domain_association": domain_association,
+            "domain_dns_record": record,
+        }
+
+
+@link_config_creator(AppSync)
+def _appsync_link_creator(api: AppSync) -> LinkConfig:
+    properties: dict[str, Any] = {"api_url": api.url}
+    permissions = [
+        AwsPermission(
+            actions=["appsync:GraphQL"],
+            resources=[api.arn.apply(lambda arn: f"{arn}/*")],
+        )
+    ]
+    if api.api_key is not None:
+        properties["api_key"] = api.api_key
+    return LinkConfig(properties=properties, permissions=permissions)

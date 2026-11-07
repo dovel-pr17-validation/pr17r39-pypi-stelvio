@@ -1,0 +1,550 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from typing import TYPE_CHECKING, Literal, Required, TypedDict, Unpack, final
+
+from pulumi_aws.dynamodb import Table
+from pulumi_aws.lambda_ import EventSourceMapping
+
+from stelvio.aws.function import (
+    Function,
+    FunctionConfig,
+    FunctionConfigDict,
+    FunctionCustomizationDict,
+    parse_handler_config,
+)
+from stelvio.aws.permission import AwsPermission
+from stelvio.component import Component, link_config_creator, parse_config, resource_name
+from stelvio.link import Link, LinkableMixin, LinkConfig
+from stelvio.provider import ProviderStore
+
+if TYPE_CHECKING:
+    from pulumi import Output, Resource
+    from pulumi_aws.dynamodb import TableArgs
+    from pulumi_aws.lambda_ import EventSourceMappingArgs
+
+    from stelvio.customize import ChildCustomization, Customization
+
+
+def _convert_projection(
+    projections: list[str] | Literal["keys-only", "all"],
+) -> dict[str, str | list[str]]:
+    """Convert projections to Pulumi format."""
+    if projections == "keys-only":
+        return {"projection_type": "KEYS_ONLY"}
+    if projections == "all":
+        return {"projection_type": "ALL"}
+    return {"projection_type": "INCLUDE", "non_key_attributes": projections}
+
+
+def _build_indexes(config: DynamoTableConfig) -> tuple[list[dict], list[dict]]:
+    """Build Pulumi index configurations."""
+    local_indexes = []
+    for name, idx in config.normalized_local_indexes.items():
+        local_indexes.append(
+            {"name": name, "range_key": idx.sort_key, **_convert_projection(idx.projections)}
+        )
+
+    # GSI hash_key/range_key are deprecated in favour of key_schemas; the LSI range_key
+    # above is not, hence the asymmetry.
+    global_indexes = []
+    for name, idx in config.normalized_global_indexes.items():
+        key_schemas = [{"attribute_name": idx.partition_key, "key_type": "HASH"}]
+        if idx.sort_key:
+            key_schemas.append({"attribute_name": idx.sort_key, "key_type": "RANGE"})
+        global_indexes.append(
+            {
+                "name": name,
+                "key_schemas": key_schemas,
+                **_convert_projection(idx.projections),
+            }
+        )
+
+    return local_indexes, global_indexes
+
+
+FieldTypeLiteral = Literal["S", "N", "B", "string", "number", "binary"]
+
+StreamViewLiteral = Literal["keys-only", "new-image", "old-image", "new-and-old-images"]
+
+# AWS DynamoDB naming constraints
+INDEX_NAME_MIN_LENGTH = 3
+INDEX_NAME_MAX_LENGTH = 255
+TABLE_NAME_MAX_LENGTH = 255
+
+
+class FieldType(Enum):
+    STRING = "S"
+    NUMBER = "N"
+    BINARY = "B"
+
+
+class StreamView(Enum):
+    KEYS_ONLY = "KEYS_ONLY"
+    NEW_IMAGE = "NEW_IMAGE"
+    OLD_IMAGE = "OLD_IMAGE"
+    NEW_AND_OLD_IMAGES = "NEW_AND_OLD_IMAGES"
+
+
+class LocalIndexDict(TypedDict, total=False):
+    sort_key: Required[str]
+    projections: list[str] | Literal["keys-only", "all"]
+
+
+class GlobalIndexDict(TypedDict, total=False):
+    partition_key: Required[str]
+    sort_key: str
+    projections: list[str] | Literal["keys-only", "all"]
+
+
+@final
+@dataclass(frozen=True)
+class LocalIndex:
+    sort_key: str
+    projections: list[str] | Literal["keys-only", "all"] = "keys-only"
+
+
+@final
+@dataclass(frozen=True)
+class GlobalIndex:
+    partition_key: str
+    sort_key: str | None = None
+    projections: list[str] | Literal["keys-only", "all"] = "keys-only"
+
+
+class DynamoTableConfigDict(TypedDict, total=False):
+    fields: dict[str, FieldType | FieldTypeLiteral]
+    partition_key: str
+    sort_key: str
+    local_indexes: dict[str, LocalIndex | LocalIndexDict]
+    global_indexes: dict[str, GlobalIndex | GlobalIndexDict]
+    stream: StreamView | StreamViewLiteral
+
+
+@final
+@dataclass(frozen=True, kw_only=True)
+class DynamoTableConfig:
+    fields: dict[str, FieldType | FieldTypeLiteral]
+    partition_key: str
+    sort_key: str | None = None
+    local_indexes: dict[str, LocalIndex | LocalIndexDict] = field(default_factory=dict)
+    global_indexes: dict[str, GlobalIndex | GlobalIndexDict] = field(default_factory=dict)
+    stream: StreamView | StreamViewLiteral | None = None
+
+    @property
+    def normalized_fields(self) -> dict[str, Literal["S", "N", "B"]]:
+        """Fields with normalized DynamoDB types."""
+        return {k: self._normalize_type(v) for k, v in self.fields.items()}
+
+    def _normalize_type(self, field_type: FieldType | FieldTypeLiteral) -> Literal["S", "N", "B"]:
+        """Normalize field type to DynamoDB format."""
+        if isinstance(field_type, FieldType):
+            return field_type.value
+
+        mapping = {"string": "S", "number": "N", "binary": "B"}
+        return mapping.get(field_type.lower(), field_type.upper())
+
+    @property
+    def normalized_local_indexes(self) -> dict[str, LocalIndex]:
+        return {
+            name: index if isinstance(index, LocalIndex) else LocalIndex(**index)
+            for name, index in self.local_indexes.items()
+        }
+
+    @property
+    def normalized_global_indexes(self) -> dict[str, GlobalIndex]:
+        return {
+            name: index if isinstance(index, GlobalIndex) else GlobalIndex(**index)
+            for name, index in self.global_indexes.items()
+        }
+
+    @property
+    def stream_enabled(self) -> bool:
+        return self.stream is not None
+
+    @property
+    def normalized_stream_view_type(
+        self,
+    ) -> Literal["KEYS_ONLY", "NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES"] | None:
+        """Stream view type in DynamoDB format."""
+        if self.stream is None:
+            return None
+
+        if isinstance(self.stream, StreamView):
+            return self.stream.value
+
+        # Convert kebab-case to DynamoDB format
+        mapping = {
+            "keys-only": "KEYS_ONLY",
+            "new-image": "NEW_IMAGE",
+            "old-image": "OLD_IMAGE",
+            "new-and-old-images": "NEW_AND_OLD_IMAGES",
+        }
+        return mapping[self.stream]
+
+    def __post_init__(self) -> None:
+        if self.partition_key not in self.fields:
+            raise ValueError(f"partition_key '{self.partition_key}' not in fields list")
+
+        if self.sort_key and self.sort_key not in self.fields:
+            raise ValueError(f"sort_key '{self.sort_key}' not in fields list")
+
+        self._validate_index_names()
+
+        for index_name, local_index in self.normalized_local_indexes.items():
+            if local_index.sort_key not in self.fields:
+                raise ValueError(
+                    f"Local index '{index_name}' "
+                    f"sort_key '{local_index.sort_key}' not in fields list"
+                )
+
+        for index_name, global_index in self.normalized_global_indexes.items():
+            if global_index.partition_key not in self.fields:
+                raise ValueError(
+                    f"Global index '{index_name}' "
+                    f"partition_key '{global_index.partition_key}' not in fields list"
+                )
+
+            if global_index.sort_key and global_index.sort_key not in self.fields:
+                raise ValueError(
+                    f"Global index '{index_name}' "
+                    f"sort_key '{global_index.sort_key}' not in fields list"
+                )
+
+        self._validate_fields_are_keys()
+
+    def _validate_fields_are_keys(self) -> None:
+        """Validate that every field is used as a key by the table or an index.
+
+        AWS rejects unused attribute definitions at deploy time, so catch it here.
+        """
+        key_fields = {self.partition_key}
+        if self.sort_key:
+            key_fields.add(self.sort_key)
+
+        for local_index in self.normalized_local_indexes.values():
+            key_fields.add(local_index.sort_key)
+
+        for global_index in self.normalized_global_indexes.values():
+            key_fields.add(global_index.partition_key)
+            if global_index.sort_key:
+                key_fields.add(global_index.sort_key)
+
+        unused_fields = [f for f in self.fields if f not in key_fields]
+        if unused_fields:
+            raise ValueError(
+                f"fields {unused_fields} not used as a key by the table or any index. "
+                "fields is only for key attributes: partition_key, sort_key, and "
+                "local/global index keys."
+            )
+
+    def _validate_index_names(self) -> None:
+        """Validate index name lengths against AWS limits (3-255 characters)."""
+        for index_name in [*self.local_indexes.keys(), *self.global_indexes.keys()]:
+            if len(index_name) < INDEX_NAME_MIN_LENGTH:
+                raise ValueError(
+                    f"Index name '{index_name}' is too short. "
+                    f"AWS requires index names to be at least {INDEX_NAME_MIN_LENGTH} characters."
+                )
+            if len(index_name) > INDEX_NAME_MAX_LENGTH:
+                raise ValueError(
+                    f"Index name '{index_name}' exceeds AWS limit of {INDEX_NAME_MAX_LENGTH} "
+                    f"characters (got {len(index_name)} characters)."
+                )
+
+
+@final
+@dataclass(frozen=True)
+class DynamoSubscriptionResources:
+    function: Function
+    event_source_mapping: EventSourceMapping
+
+
+@final
+@dataclass(frozen=True)
+class DynamoTableResources:
+    table: Table
+
+
+class DynamoSubscriptionCustomizationDict(TypedDict, total=False):
+    function: ChildCustomization[FunctionCustomizationDict]
+    event_source_mapping: Customization[EventSourceMappingArgs]
+
+
+class DynamoTableCustomizationDict(TypedDict, total=False):
+    table: Customization[TableArgs]
+
+
+@final
+class DynamoSubscription(
+    Component[DynamoSubscriptionResources, DynamoSubscriptionCustomizationDict]
+):
+    def __init__(  # noqa: PLR0913
+        self,
+        name: str,
+        table: DynamoTable,
+        handler: str | FunctionConfig | FunctionConfigDict | None,
+        filters: list[dict] | None,
+        batch_size: int | None,
+        opts: FunctionConfigDict,
+        *,
+        tags: dict[str, str] | None = None,
+        customize: DynamoSubscriptionCustomizationDict | None = None,
+        parent: Resource | None = None,
+    ):
+        # Add suffix because we want to use 'name' for Function, avoiding component name conflicts
+        super().__init__(
+            ProviderStore.aws(),
+            "stelvio:aws:DynamoSubscription",
+            f"{name}-subscription",
+            tags=tags,
+            customize=customize,
+            parent=parent,
+        )
+        self._table = table
+        self._function_name = name  # Function gets the original name
+
+        # Store subscription config as attributes
+        self._filters = filters
+        self._batch_size = batch_size
+        self._handler = parse_handler_config(handler, opts)
+
+    def _create_resources(self) -> DynamoSubscriptionResources:
+        # Create stream link (mandatory for EventSourceMapping)
+        stream_link = self._create_stream_link()
+
+        # Merge stream link with existing links from user's config
+        merged_links = [stream_link, *self._handler.links]
+
+        # Create new config with merged links
+        config_with_merged_links = replace(self._handler, links=merged_links)
+
+        # Create function with merged permissions
+        function = Function(
+            self._function_name,
+            config_with_merged_links,
+            tags=self.tags,
+            customize=self._customize.get("function", {}),
+            parent=self,
+        )
+
+        # Create EventSourceMapping - table.stream_arn triggers table creation naturally
+        mapping = EventSourceMapping(
+            resource_name(f"{self.name}-mapping", limit=128),
+            **self._customizer(
+                "event_source_mapping",
+                {
+                    "batch_size": self._batch_size,
+                    "filter_criteria": {"filters": self._filters} if self._filters else None,
+                },
+                default_props={
+                    "event_source_arn": self._table.stream_arn,
+                    "function_name": function.function_name,
+                    "starting_position": "LATEST",
+                    "batch_size": 100,
+                    "maximum_batching_window_in_seconds": 0,
+                },
+            ),
+            opts=self._resource_opts(),
+        )
+
+        return DynamoSubscriptionResources(function, mapping)
+
+    def _create_stream_link(self) -> Link:
+        """Create link with DynamoDB stream permissions required for EventSourceMapping."""
+        return Link(
+            f"{self._table.name}-stream",
+            properties={},
+            permissions=[
+                AwsPermission(
+                    actions=[
+                        "dynamodb:DescribeStream",
+                        "dynamodb:GetRecords",
+                        "dynamodb:GetShardIterator",
+                        "dynamodb:ListStreams",
+                    ],
+                    resources=[self._table.stream_arn],
+                )
+            ],
+        )
+
+
+@final
+class DynamoTable(Component[DynamoTableResources, DynamoTableCustomizationDict], LinkableMixin):
+    _subscriptions: list[DynamoSubscription]
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        config: DynamoTableConfig | DynamoTableConfigDict | None = None,
+        tags: dict[str, str] | None = None,
+        customize: DynamoTableCustomizationDict | None = None,
+        **opts: Unpack[DynamoTableConfigDict],
+    ):
+        super().__init__(
+            ProviderStore.aws(), "stelvio:aws:DynamoTable", name, tags=tags, customize=customize
+        )
+
+        try:
+            self._config = parse_config(DynamoTableConfig, config, opts)
+        except ValueError as e:
+            raise ValueError(f"DynamoTable '{name}': {e}") from e
+        self._subscriptions = []
+
+    @property
+    def config(self) -> DynamoTableConfig:
+        return self._config
+
+    @property
+    def partition_key(self) -> str:
+        return self._config.partition_key
+
+    @property
+    def sort_key(self) -> str | None:
+        return self._config.sort_key
+
+    @property
+    def arn(self) -> Output[str]:
+        return self.resources.table.arn
+
+    @property
+    def stream_arn(self) -> Output[str] | None:
+        return self.resources.table.stream_arn if self._config.stream_enabled else None
+
+    def subscribe(
+        self,
+        name: str,
+        handler: str | FunctionConfig | FunctionConfigDict | None = None,
+        /,
+        *,
+        filters: list[dict] | None = None,
+        batch_size: int | None = None,
+        customize: DynamoSubscriptionCustomizationDict | None = None,
+        **opts: Unpack[FunctionConfigDict],
+    ) -> DynamoSubscription:
+        """Subscribe a Lambda function to this table's DynamoDB stream.
+
+        Uses production-ready defaults: batch_size=100, starting_position="LATEST",
+        immediate processing (no batching window).
+
+        Args:
+            name: Name for the subscription (used in Lambda function naming)
+            handler: Lambda handler specification. Can be:
+                - Function handler path as string
+                - Complete FunctionConfig object
+                - FunctionConfigDict dictionary
+                - None (if handler is specified in opts)
+            filters: EventSourceMapping filter patterns for stream records.
+                Each filter is a dict with 'pattern' key containing DynamoDB stream filter JSON.
+            batch_size: Maximum number of records to process per Lambda invocation (default: 100).
+            customize: Customization for the subscription's `function` and `event_source_mapping`
+            **opts: Lambda function configuration (memory, timeout, runtime, etc.)
+
+        Raises:
+            ValueError: If streams are not enabled on this table
+            ValueError: If the configuration is ambiguous or incomplete
+            TypeError: If handler is of invalid type
+            ValueError: If a subscription with the same name already exists
+
+        Examples:
+            # Simple subscription
+            orders_table.subscribe("process-orders", "functions/orders_events.handler")
+
+            # With function configuration
+            orders_table.subscribe(
+                "audit-orders", "functions/audit.handler", memory=256, timeout=60
+            )
+
+            # With filtering and batch size
+            orders_table.subscribe(
+                "process-inserts",
+                "functions/handlers.process_insert",
+                filters=[{"pattern": '{"eventName": ["INSERT"]}'}],
+                batch_size=50
+            )
+        """
+        if not self._config.stream_enabled:
+            raise ValueError(
+                f"Cannot subscribe to table '{self.name}' - streams are not enabled. "
+                "Add stream parameter when creating the table."
+            )
+
+        function_name = f"{self.name}-{name}"
+        expected_subscription_name = f"{function_name}-subscription"
+
+        # Check for duplicate subscription names before creating the component
+        if any(sub.name == expected_subscription_name for sub in self._subscriptions):
+            raise ValueError(f"Subscription '{name}' already exists for table '{self.name}'")
+
+        subscription = DynamoSubscription(
+            function_name,
+            self,
+            handler,
+            filters,
+            batch_size,
+            opts,
+            tags=self.tags,
+            customize=customize,
+            parent=self,
+        )
+
+        self._subscriptions.append(subscription)
+        return subscription
+
+    def _create_resources(self) -> DynamoTableResources:
+        local_indexes, global_indexes = _build_indexes(self._config)
+
+        table = Table(
+            resource_name(self.name, limit=TABLE_NAME_MAX_LENGTH),
+            **self._customizer(
+                "table",
+                {
+                    "hash_key": self.partition_key,
+                    "range_key": self.sort_key,
+                    "attributes": [
+                        {"name": k, "type": v} for k, v in self._config.normalized_fields.items()
+                    ],
+                    "local_secondary_indexes": local_indexes or None,
+                    "global_secondary_indexes": global_indexes or None,
+                    "stream_enabled": self._config.stream_enabled or None,
+                    "stream_view_type": self._config.normalized_stream_view_type,
+                },
+                {"billing_mode": "PAY_PER_REQUEST", "stream_enabled": False},
+                inject_tags=True,
+            ),
+            opts=self._resource_opts(),
+        )
+        return DynamoTableResources(table)
+
+
+@link_config_creator(DynamoTable)
+def default_dynamo_table_link(table_component: DynamoTable) -> LinkConfig:
+    # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_examples_lambda-access-dynamodb.html
+    table = table_component.resources.table
+    return LinkConfig(
+        properties={"table_arn": table.arn, "table_name": table.name},
+        permissions=[
+            # Main table permissions - full CRUD
+            AwsPermission(
+                actions=[
+                    "dynamodb:Scan",
+                    "dynamodb:Query",
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:DeleteItem",
+                ],
+                resources=[table.arn],
+            ),
+            # Index permissions - read only (Query/Scan only, no GetItem/writes)
+            AwsPermission(
+                actions=[
+                    "dynamodb:Query",
+                    "dynamodb:Scan",
+                ],
+                resources=[table.arn.apply(lambda arn: f"{arn}/index/*")],
+            ),
+        ],
+    )

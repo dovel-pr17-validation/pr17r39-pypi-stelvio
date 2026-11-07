@@ -1,0 +1,417 @@
+import re
+
+import pulumi
+import pytest
+
+from stelvio.aws.cors import CorsConfig
+from stelvio.aws.function import Function
+
+from ...conftest import TP
+from ..conftest import create_app_context_with_global_customize
+from ..pulumi_mocks import R
+
+pytestmark = pytest.mark.usefixtures("project_cwd")
+
+PERMISSIVE_CORS_ORIGINS = ["*"]
+PERMISSIVE_CORS_METHODS = ["*"]
+PERMISSIVE_CORS_HEADERS = ["*"]
+
+
+def _get_function_url(pulumi_mocks, expected_name):
+    [url_args] = pulumi_mocks.created(R.FUNCTION_URL)
+    assert url_args.name == expected_name
+    return url_args
+
+
+def _assert_auth(url_args, expected_auth):
+    assert url_args.inputs["authorizationType"] == expected_auth
+
+
+def _assert_invoke_mode(url_args, expected_mode):
+    assert url_args.inputs["invokeMode"] == expected_mode
+
+
+def _assert_cors(  # noqa: PLR0913
+    url_args,
+    origins,
+    methods,
+    headers,
+    credentials=False,
+    max_age=None,
+    expose_headers=None,
+):
+    cors = url_args.inputs["cors"]
+    assert cors is not None
+
+    expected = {
+        "allowOrigins": origins,
+        "allowMethods": methods,
+        "allowHeaders": headers,
+        "allowCredentials": credentials,
+    }
+    if max_age is not None:
+        expected["maxAge"] = max_age
+    if expose_headers is not None:
+        expected["exposeHeaders"] = expose_headers
+
+    assert cors == expected
+
+
+def test_function_url_shortcut_public(pulumi_mocks, project_cwd):
+    function = Function("public-fn", handler="functions/simple.handler", url="public")
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    url_args = _get_function_url(pulumi_mocks, f"{TP}public-fn-url")
+    _assert_auth(url_args, "NONE")
+    _assert_invoke_mode(url_args, "BUFFERED")
+    _assert_cors(
+        url_args, PERMISSIVE_CORS_ORIGINS, PERMISSIVE_CORS_METHODS, PERMISSIVE_CORS_HEADERS
+    )
+    assert function.resources.function_url is not None
+
+
+def test_function_url_shortcut_private(pulumi_mocks, project_cwd):
+    function = Function("private-fn", handler="functions/simple.handler", url="private")
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    url_args = _get_function_url(pulumi_mocks, f"{TP}private-fn-url")
+    _assert_auth(url_args, "AWS_IAM")
+    _assert_invoke_mode(url_args, "BUFFERED")
+    assert url_args.inputs.get("cors") is None
+    assert function.resources.function_url is not None
+
+
+def test_function_url_dict_full_config(pulumi_mocks, project_cwd):
+    function = Function(
+        "full-config-fn",
+        handler="functions/simple.handler",
+        url={
+            "auth": "iam",
+            "cors": CorsConfig(
+                allow_origins="https://example.com",
+                allow_methods=["GET", "POST"],
+                allow_headers=["Content-Type", "Authorization"],
+                allow_credentials=True,
+                max_age=3600,
+                expose_headers=["X-Custom-Header"],
+            ),
+            "streaming": True,
+        },
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    url_args = _get_function_url(pulumi_mocks, f"{TP}full-config-fn-url")
+    _assert_auth(url_args, "AWS_IAM")
+    _assert_invoke_mode(url_args, "RESPONSE_STREAM")
+    _assert_cors(
+        url_args,
+        ["https://example.com"],
+        ["GET", "POST"],
+        ["Content-Type", "Authorization"],
+        credentials=True,
+        max_age=3600,
+        expose_headers=["X-Custom-Header"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("streaming", "expected_mode", "fn_suffix"),
+    [
+        (False, "BUFFERED", "buffered"),
+        (True, "RESPONSE_STREAM", "streaming"),
+    ],
+    ids=["streaming_false_buffered", "streaming_true_response_stream"],
+)
+def test_function_url_streaming_modes(
+    pulumi_mocks, project_cwd, streaming, expected_mode, fn_suffix
+):
+    fn_name = f"{fn_suffix}-fn"
+    function = Function(
+        fn_name,
+        handler="functions/simple.handler",
+        url={"auth": None, "streaming": streaming},
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    url_args = _get_function_url(pulumi_mocks, f"{TP}{fn_name}-url")
+    _assert_invoke_mode(url_args, expected_mode)
+
+
+@pytest.mark.parametrize(
+    (
+        "test_id",
+        "cors_config",
+        "expected_origins",
+        "expected_methods",
+        "expected_headers",
+        "expected_max_age",
+    ),
+    [
+        (
+            "string-to-list",
+            CorsConfig(
+                allow_origins="https://single-origin.com",
+                allow_methods="GET",
+                allow_headers="Content-Type",
+            ),
+            ["https://single-origin.com"],
+            ["GET"],
+            ["Content-Type"],
+            None,
+        ),
+        (
+            "list-unchanged",
+            CorsConfig(
+                allow_origins=["https://origin1.com", "https://origin2.com"],
+                allow_methods=["GET", "POST", "PUT"],
+                allow_headers=["Content-Type", "Authorization"],
+            ),
+            ["https://origin1.com", "https://origin2.com"],
+            ["GET", "POST", "PUT"],
+            ["Content-Type", "Authorization"],
+            None,
+        ),
+        (
+            "dict-config",
+            {
+                "allow_origins": "https://dict-origin.com",
+                "allow_methods": ["GET", "POST"],
+                "allow_headers": "Authorization",
+                "max_age": 7200,
+            },
+            ["https://dict-origin.com"],
+            ["GET", "POST"],
+            ["Authorization"],
+            7200,
+        ),
+    ],
+    ids=["string_to_list_conversion", "list_unchanged", "dict_config"],
+)
+def test_function_url_cors_normalization(  # noqa: PLR0913
+    pulumi_mocks,
+    project_cwd,
+    test_id,
+    cors_config,
+    expected_origins,
+    expected_methods,
+    expected_headers,
+    expected_max_age,
+):
+    fn_name = f"cors-{test_id}-fn"
+    function = Function(
+        fn_name,
+        handler="functions/simple.handler",
+        url={"auth": None, "cors": cors_config},
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    url_args = _get_function_url(pulumi_mocks, f"{TP}{fn_name}-url")
+    _assert_cors(
+        url_args,
+        expected_origins,
+        expected_methods,
+        expected_headers,
+        max_age=expected_max_age,
+    )
+
+
+@pulumi.runtime.test
+def test_function_url_property_returns_output(pulumi_mocks, project_cwd):
+    function = Function("url-property-fn", handler="functions/simple.handler", url="public")
+
+    def check_url_property(url_value):
+        pattern = r"^https://[a-z0-9-]+\.lambda-url\.[a-z0-9-]+\.on\.aws/$"
+        assert re.match(pattern, url_value), (
+            f"URL doesn't match expected Lambda URL format. Got: {url_value}"
+        )
+
+    function.url.apply(check_url_property)
+
+
+def test_function_url_property_none_when_not_configured(pulumi_mocks, project_cwd):
+    function = Function("no-url-fn", handler="functions/simple.handler")
+
+    def check_url_property(url_value):
+        assert url_value is None
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.url.apply(check_url_property)
+
+    deploy()
+
+    pulumi_mocks.assert_no_res(R.FUNCTION_URL)
+    assert function.resources.function_url is None
+
+
+def test_function_url_cors_true_uses_permissive_defaults(pulumi_mocks, project_cwd):
+    function = Function(
+        "cors-true-fn",
+        handler="functions/simple.handler",
+        url={"auth": None, "cors": True},
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    url_args = _get_function_url(pulumi_mocks, f"{TP}cors-true-fn-url")
+    _assert_cors(
+        url_args,
+        PERMISSIVE_CORS_ORIGINS,
+        PERMISSIVE_CORS_METHODS,
+        PERMISSIVE_CORS_HEADERS,
+    )
+
+
+def test_function_url_auth_none_has_no_cors_by_default(pulumi_mocks, project_cwd):
+    function = Function(
+        "auth-none-fn",
+        handler="functions/simple.handler",
+        url={"auth": None},
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    url_args = _get_function_url(pulumi_mocks, f"{TP}auth-none-fn-url")
+    _assert_auth(url_args, "NONE")
+    assert url_args.inputs.get("cors") is None
+
+
+def test_function_url_auth_default_becomes_none_for_standalone(pulumi_mocks, project_cwd):
+    function = Function(
+        "auth-default-fn",
+        handler="functions/simple.handler",
+        url={"auth": "default"},
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    url_args = _get_function_url(pulumi_mocks, f"{TP}auth-default-fn-url")
+    _assert_auth(url_args, "NONE")
+
+
+def test_function_url_function_name_reference(pulumi_mocks, project_cwd):
+    function = Function("ref-test-fn", handler="functions/simple.handler", url="public")
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    url_args = _get_function_url(pulumi_mocks, f"{TP}ref-test-fn-url")
+    # Verify the Function URL references the correct Lambda function
+    expected_function_name = f"{TP}ref-test-fn-test-name"
+    assert url_args.inputs["functionName"] == expected_function_name
+
+
+@pulumi.runtime.test
+def test_function_resources_signature_with_function_url(pulumi_mocks, project_cwd):
+    from pulumi_aws.lambda_ import FunctionUrl
+
+    function_with_url = Function("with-url-fn", handler="functions/simple.handler", url="public")
+    function_without_url = Function("without-url-fn", handler="functions/simple.handler")
+
+    def check_resources(_):
+        assert function_with_url.resources.function_url is not None
+        assert isinstance(function_with_url.resources.function_url, FunctionUrl)
+        assert function_without_url.resources.function_url is None
+
+    function_with_url.invoke_arn.apply(check_resources)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        pytest.param({}, ("AWS_IAM", "RESPONSE_STREAM"), id="unset"),
+        pytest.param({"auth": None, "streaming": False}, ("NONE", "BUFFERED"), id="explicit"),
+        pytest.param("public", ("NONE", "RESPONSE_STREAM"), id="public-sets-auth-only"),
+    ],
+)
+def test_function_url_app_wide_dict_fills_only_what_the_user_left_unset(
+    pulumi_mocks, url, expected
+):
+    create_app_context_with_global_customize(
+        {
+            Function: {
+                "function_url": {
+                    "authorization_type": "AWS_IAM",
+                    "invoke_mode": "RESPONSE_STREAM",
+                }
+            }
+        }
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", url=url).url
+
+    deploy()
+
+    auth, mode = expected
+    pulumi_mocks.assert_res(
+        "fn-url",
+        R.FUNCTION_URL,
+        {"authorizationType": auth, "invokeMode": mode},
+        partial=True,
+    )
+
+
+def test_function_url_app_wide_callable_sees_unset_values_as_none(pulumi_mocks):
+    seen = {}
+
+    def app_wide(props):
+        seen.update(props)
+        return props
+
+    create_app_context_with_global_customize({Function: {"function_url": app_wide}})
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", url={}).url
+
+    deploy()
+
+    assert (seen["authorization_type"], seen["invoke_mode"]) == (None, None)
+    pulumi_mocks.assert_res(
+        "fn-url",
+        R.FUNCTION_URL,
+        {"authorizationType": "NONE", "invokeMode": "BUFFERED"},
+        partial=True,
+    )

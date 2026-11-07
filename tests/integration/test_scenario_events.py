@@ -1,0 +1,382 @@
+"""Scenario tests: async event triggers.
+
+Verifies that event sources (SQS, SNS, S3, DynamoDB Streams, Cron) actually
+trigger Lambda functions. Each test deploys a results DynamoDB table + the
+event_recorder handler, triggers an event, then polls the results table.
+"""
+
+import json
+import time
+
+import pytest
+
+from stelvio.aws.cron import Cron
+from stelvio.aws.dynamo_db import DynamoTable
+from stelvio.aws.queue import Queue
+from stelvio.aws.s3 import Bucket
+from stelvio.aws.topic import Topic
+
+from .assert_helpers import (
+    drain_sqs,
+    poll_dynamo_items,
+    poll_sqs_messages,
+    publish_sns_message,
+    put_dynamo_item,
+    send_sqs_message,
+    upload_s3_object,
+    wait_for_event_source_mapping,
+)
+from .conftest import FORCE_DESTROY_BUCKET
+from .export_helpers import (
+    export_bucket,
+    export_dynamo_table,
+    export_function,
+    export_queue,
+    export_topic,
+)
+
+pytestmark = pytest.mark.integration
+
+# AWS sends s3:TestEvent when bucket notifications are configured.
+# Wait this long before draining the queue to ensure the test event arrives.
+_S3_NOTIFICATION_SETUP_WAIT = 10
+
+
+def _results_table():
+    """Create a DynamoDB table for recording events. Reused by all async tests."""
+    return DynamoTable("results", fields={"pk": "S"}, partition_key="pk")
+
+
+# --- Queue ---
+
+
+def test_scenario_queue_triggers_lambda(stelvio_env, project_dir):
+    """SQS message triggers Lambda which writes to results table."""
+
+    def infra():
+        results = _results_table()
+        queue = Queue("jobs")
+        queue.subscribe("worker", "handlers/event_recorder.main", links=[results])
+        export_dynamo_table(results)
+        export_queue(queue)
+
+    outputs = stelvio_env.deploy(infra)
+
+    # Trigger: send message to queue
+    send_sqs_message(outputs["queue_jobs_url"], {"task": "process-123"})
+
+    # Poll: wait for event_recorder to write to results table
+    items = poll_dynamo_items(outputs["dynamotable_results_name"])
+    assert len(items) >= 1
+    event = json.loads(items[0]["event"])
+    # SQS event wraps message in Records[].body as a JSON string
+    sqs_body = json.loads(event["Records"][0]["body"])
+    assert sqs_body["task"] == "process-123"
+
+
+# --- Topic ---
+
+
+def test_scenario_topic_triggers_lambda(stelvio_env, project_dir):
+    """SNS message triggers Lambda subscriber which writes to results table."""
+
+    def infra():
+        results = _results_table()
+        topic = Topic("alerts")
+        topic.subscribe("handler", "handlers/event_recorder.main", links=[results])
+        export_dynamo_table(results)
+        export_topic(topic)
+
+    outputs = stelvio_env.deploy(infra)
+
+    # Trigger: publish to topic
+    publish_sns_message(outputs["topic_alerts_arn"], {"alert": "server-down"})
+
+    # Poll: wait for event_recorder
+    items = poll_dynamo_items(outputs["dynamotable_results_name"])
+    assert len(items) >= 1
+    event = json.loads(items[0]["event"])
+    # SNS event wraps message in Records[].Sns.Message as a JSON string
+    sns_message = json.loads(event["Records"][0]["Sns"]["Message"])
+    assert sns_message["alert"] == "server-down"
+
+
+def test_scenario_topic_fanout_to_queue(stelvio_env, project_dir):
+    """SNS publishes to SQS queue via subscribe_queue — no Lambda involved."""
+
+    def infra():
+        topic = Topic("events")
+        inbox = Queue("inbox")
+        topic.subscribe_queue("forward", inbox)
+        export_topic(topic)
+        export_queue(inbox)
+
+    outputs = stelvio_env.deploy(infra)
+
+    # Trigger: publish to topic
+    publish_sns_message(outputs["topic_events_arn"], {"event": "user-signup"})
+
+    # Poll: message should appear in the queue
+    messages = poll_sqs_messages(outputs["queue_inbox_url"])
+    assert len(messages) >= 1
+    # SQS body is the SNS notification JSON; Message field has our payload
+    sns_notification = messages[0]
+    assert sns_notification["Type"] == "Notification"
+    payload = json.loads(sns_notification["Message"])
+    assert payload["event"] == "user-signup"
+
+
+# --- S3 ---
+
+
+def test_scenario_s3_triggers_lambda(stelvio_env, project_dir):
+    """S3 upload triggers notify_function Lambda which writes to results table."""
+
+    def infra():
+        results = _results_table()
+        bucket = Bucket("uploads", customize=FORCE_DESTROY_BUCKET)
+        bucket.notify_function(
+            "processor",
+            events=["s3:ObjectCreated:*"],
+            function="handlers/event_recorder.main",
+            links=[results],
+        )
+        export_dynamo_table(results)
+        export_bucket(bucket)
+
+    outputs = stelvio_env.deploy(infra)
+
+    # Trigger: upload a file
+    upload_s3_object(outputs["s3bucket_uploads_name"], "test/file.txt", "hello")
+
+    # Poll: wait for event_recorder
+    items = poll_dynamo_items(outputs["dynamotable_results_name"])
+    assert len(items) >= 1
+    event = json.loads(items[0]["event"])
+    # S3 event contains bucket name and object key in Records[].s3
+    s3_record = event["Records"][0]["s3"]
+    assert s3_record["object"]["key"] == "test/file.txt"
+
+
+def test_scenario_s3_triggers_queue(stelvio_env, project_dir):
+    """S3 upload triggers notify_queue — message appears in SQS."""
+
+    def infra():
+        bucket = Bucket("inbox", customize=FORCE_DESTROY_BUCKET)
+        queue = Queue("notifications")
+        bucket.notify_queue(
+            "on-upload",
+            events=["s3:ObjectCreated:*"],
+            queue=queue,
+        )
+        export_bucket(bucket)
+        export_queue(queue)
+
+    outputs = stelvio_env.deploy(infra)
+    queue_url = outputs["queue_notifications_url"]
+
+    # Wait for and drain the S3 test event that AWS sends on notification setup
+    time.sleep(_S3_NOTIFICATION_SETUP_WAIT)
+    drain_sqs(queue_url)
+
+    # Trigger: upload a file
+    upload_s3_object(outputs["s3bucket_inbox_name"], "doc.pdf", "content")
+
+    # Poll: S3 notification should appear in queue
+    messages = poll_sqs_messages(queue_url)
+    assert len(messages) >= 1
+    # S3 sends event notification directly to SQS
+    s3_record = messages[0]["Records"][0]["s3"]
+    assert s3_record["object"]["key"] == "doc.pdf"
+
+
+def test_scenario_s3_triggers_topic(stelvio_env, project_dir):
+    """S3 upload triggers notify_topic — message flows through to subscribed queue."""
+
+    def infra():
+        bucket = Bucket("files", customize=FORCE_DESTROY_BUCKET)
+        topic = Topic("file-events")
+        queue = Queue("listener")
+        bucket.notify_topic(
+            "on-upload",
+            events=["s3:ObjectCreated:*"],
+            topic=topic,
+        )
+        # Subscribe a queue to the topic so we can poll for the message
+        topic.subscribe_queue("forward", queue)
+        export_bucket(bucket)
+        export_queue(queue)
+
+    outputs = stelvio_env.deploy(infra)
+    queue_url = outputs["queue_listener_url"]
+
+    # Drain S3 test event that AWS sends through SNS→SQS on notification setup
+    time.sleep(_S3_NOTIFICATION_SETUP_WAIT)
+    drain_sqs(queue_url)
+
+    # Trigger: upload a file
+    upload_s3_object(outputs["s3bucket_files_name"], "image.png", "pixels")
+
+    # Poll: message should flow S3 → Topic → Queue
+    messages = poll_sqs_messages(queue_url)
+    assert len(messages) >= 1
+    # S3 → SNS → SQS: SNS notification wraps S3 event in Message field
+    s3_event = json.loads(messages[0]["Message"])
+    assert s3_event["Records"][0]["s3"]["object"]["key"] == "image.png"
+
+
+def test_scenario_bucket_and_topic_send_to_one_queue(stelvio_env, project_dir):
+    """A bucket and a topic sending to one queue both deliver."""
+
+    def infra():
+        bucket = Bucket("uploads", customize=FORCE_DESTROY_BUCKET)
+        topic = Topic("events")
+        queue = Queue("inbox")
+        bucket.notify_queue("on-upload", events=["s3:ObjectCreated:*"], queue=queue)
+        topic.subscribe_queue("forward", queue)
+        export_bucket(bucket)
+        export_topic(topic)
+        export_queue(queue)
+
+    outputs = stelvio_env.deploy(infra)
+    queue_url = outputs["queue_inbox_url"]
+
+    time.sleep(_S3_NOTIFICATION_SETUP_WAIT)
+    drain_sqs(queue_url)
+
+    upload_s3_object(outputs["s3bucket_uploads_name"], "doc.txt", "content")
+    s3_record = poll_sqs_messages(queue_url)[0]["Records"][0]["s3"]
+    assert s3_record["object"]["key"] == "doc.txt"
+
+    publish_sns_message(outputs["topic_events_arn"], {"event": "user-signup"})
+    sns_notification = poll_sqs_messages(queue_url)[0]
+    assert json.loads(sns_notification["Message"]) == {"event": "user-signup"}
+
+
+def test_scenario_removing_a_sender_keeps_the_others(stelvio_env, project_dir):
+    """Removing a bucket and a topic leaves the other bucket delivering to the queue and topic."""
+
+    def infra(bucket_names, inbox_topic_names):
+        queue = Queue("inbox")
+        topic = Topic("events")
+        fanout = Queue("fanout")
+        topic.subscribe_queue("forward", fanout)
+        for name in inbox_topic_names:
+            Topic(name).subscribe_queue("to-inbox", queue)
+        for name in bucket_names:
+            bucket = Bucket(name, customize=FORCE_DESTROY_BUCKET)
+            # S3 rejects two configs for one event type unless their prefixes don't overlap
+            bucket.notify_queue(
+                "to-queue", events=["s3:ObjectCreated:*"], filter_prefix="q/", queue=queue
+            )
+            bucket.notify_topic(
+                "to-topic", events=["s3:ObjectCreated:*"], filter_prefix="t/", topic=topic
+            )
+            export_bucket(bucket)
+        export_queue(queue)
+        export_queue(fanout)
+
+    def assert_first_bucket_delivers(outputs, key):
+        bucket_name = outputs["s3bucket_first_name"]
+        queue_url = outputs["queue_inbox_url"]
+        fanout_url = outputs["queue_fanout_url"]
+
+        time.sleep(_S3_NOTIFICATION_SETUP_WAIT)
+        drain_sqs(queue_url)
+        drain_sqs(fanout_url)
+
+        upload_s3_object(bucket_name, f"q/{key}", "content")
+        s3_record = poll_sqs_messages(queue_url)[0]["Records"][0]["s3"]
+        assert s3_record["object"]["key"] == f"q/{key}"
+
+        upload_s3_object(bucket_name, f"t/{key}", "content")
+        s3_event = json.loads(poll_sqs_messages(fanout_url)[0]["Message"])
+        assert s3_event["Records"][0]["s3"]["object"]["key"] == f"t/{key}"
+
+    outputs = stelvio_env.deploy(lambda: infra(["first", "second"], ["extra"]))
+    assert_first_bucket_delivers(outputs, "before.txt")
+
+    outputs = stelvio_env.deploy(lambda: infra(["first"], []))
+    assert_first_bucket_delivers(outputs, "after.txt")
+
+
+# --- DynamoDB Streams ---
+
+
+def test_scenario_dynamo_stream_triggers_lambda(stelvio_env, project_dir):
+    """DynamoDB Stream triggers Lambda which writes to results table."""
+
+    def infra():
+        results = _results_table()
+        source = DynamoTable(
+            "source",
+            fields={"pk": "S"},
+            partition_key="pk",
+            stream="new-image",
+        )
+        sub = source.subscribe("processor", "handlers/event_recorder.main", links=[results])
+        export_dynamo_table(results)
+        export_dynamo_table(source)
+        export_function(sub.resources.function)
+
+    outputs = stelvio_env.deploy(infra)
+    source_table = outputs["dynamotable_source_name"]
+    results_table = outputs["dynamotable_results_name"]
+
+    # Wait for event source mapping to reach "Enabled" state.
+    wait_for_event_source_mapping(outputs["function_source-processor_arn"])
+
+    # DynamoDB Streams ESM with starting_position=LATEST needs time to discover
+    # shards and start polling even after reaching "Enabled" state. Write items
+    # periodically so the ESM picks one up once it starts reading.
+    deadline = time.monotonic() + 180
+    write_counter = 0
+
+    while time.monotonic() < deadline:
+        write_counter += 1
+        put_dynamo_item(source_table, {"pk": f"change-{write_counter}", "data": "test"})
+        time.sleep(15)
+
+        try:
+            items = poll_dynamo_items(results_table, timeout=5)
+        except AssertionError:
+            continue
+
+        event = json.loads(items[0]["event"])
+        # DynamoDB Stream event contains Records[].dynamodb with the changed item
+        record = event["Records"][0]
+        assert record["eventSource"] == "aws:dynamodb"
+        assert "NewImage" in record["dynamodb"]
+        return
+
+    raise AssertionError(
+        f"DynamoDB Stream never triggered Lambda after {write_counter} writes over 180s"
+    )
+
+
+# --- Cron ---
+
+
+def test_scenario_cron_triggers_lambda(stelvio_env, project_dir):
+    """Cron fires every minute — verify Lambda is invoked at least once.
+
+    This test waits up to 120s for the first cron fire. The cron schedule
+    is rate(1 minute), so the first invocation happens within 0-60s after
+    deploy completes, plus some EventBridge propagation time.
+    """
+
+    def infra():
+        results = _results_table()
+        Cron(
+            "ticker",
+            "rate(1 minute)",
+            "handlers/event_recorder.main",
+            links=[results],
+        )
+        export_dynamo_table(results)
+
+    outputs = stelvio_env.deploy(infra)
+
+    # Poll: wait for cron to fire (up to 120s)
+    items = poll_dynamo_items(outputs["dynamotable_results_name"], timeout=120)
+    assert len(items) >= 1

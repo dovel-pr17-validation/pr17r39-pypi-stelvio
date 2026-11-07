@@ -1,0 +1,104 @@
+from collections.abc import Callable
+
+import pulumi
+from pulumi_aws.iam import (
+    GetPolicyDocumentStatementArgs,
+    GetPolicyDocumentStatementPrincipalArgs,
+    Policy,
+    Role,
+    RolePolicyAttachment,
+    get_policy_document,
+)
+
+from stelvio import context
+from stelvio.component import child_label, resource_name
+
+from .constants import LAMBDA_BASIC_EXECUTION_ROLE, LAMBDA_VPC_ACCESS_EXECUTION_ROLE
+
+_ROLE_ATTACHMENT_SUFFIX = "-r-p-attachment"
+
+
+def _create_lambda_role(
+    name: str,
+    customizer: Callable[[str, dict], dict] | None = None,
+    opts: pulumi.ResourceOptions | None = None,
+) -> Role:
+    """Create basic execution role for Lambda.
+
+    Args:
+        name: The function name used for resource naming.
+        customizer: Optional callback to apply customizations to the role properties.
+        opts: Pulumi resource options (parent, aliases, etc.).
+    """
+    assume_role_policy = get_policy_document(
+        statements=[
+            GetPolicyDocumentStatementArgs(
+                actions=["sts:AssumeRole"],
+                principals=[
+                    GetPolicyDocumentStatementPrincipalArgs(
+                        identifiers=["lambda.amazonaws.com"], type="Service"
+                    )
+                ],
+            )
+        ]
+    )
+
+    default_props = {"assume_role_policy": assume_role_policy.json}
+    if customizer:
+        default_props = customizer("role", default_props)
+
+    return Role(
+        resource_name(name, limit=64, suffix="-r"),
+        **default_props,
+        opts=opts,
+    )
+
+
+def _attach_role_policies(
+    name: str,
+    role: Role,
+    function_policy: Policy | None,
+    opts: pulumi.ResourceOptions | None = None,
+    *,
+    vpc_access: bool = False,
+) -> list[RolePolicyAttachment]:
+    """Attach required policies to Lambda role.
+
+    With `vpc_access`, also the AWS-managed VPC access policy: AWS refuses a function's
+    `vpc_config` unless its role can manage network interfaces, so callers put the
+    returned attachments in the function's `depends_on`.
+    """
+    attachments = [
+        RolePolicyAttachment(
+            context().prefix(f"{name}-basic-execution{_ROLE_ATTACHMENT_SUFFIX}"),
+            role=role.name,
+            policy_arn=LAMBDA_BASIC_EXECUTION_ROLE,
+            opts=opts,
+        )
+    ]
+    if vpc_access:
+        attachments.append(
+            RolePolicyAttachment(
+                context().prefix(f"{name}-vpc-access{_ROLE_ATTACHMENT_SUFFIX}"),
+                role=role.name,
+                policy_arn=LAMBDA_VPC_ACCESS_EXECUTION_ROLE,
+                opts=opts,
+            )
+        )
+    if function_policy:
+        attachments.append(
+            RolePolicyAttachment(
+                context().prefix(f"{name}-default{_ROLE_ATTACHMENT_SUFFIX}"),
+                role=role.name,
+                policy_arn=function_policy.arn,
+                opts=opts,
+            )
+        )
+    return attachments
+
+
+@child_label("Function")
+def _function_child_label(name: str) -> str:
+    """Label for every same-type child of a Function; today only the role attachments
+    qualify: `basic-execution-r-p-attachment` -> `basic-execution`."""
+    return name.removesuffix(_ROLE_ATTACHMENT_SUFFIX)

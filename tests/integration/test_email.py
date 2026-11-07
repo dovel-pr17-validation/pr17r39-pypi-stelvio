@@ -1,0 +1,96 @@
+import pytest
+
+from stelvio.aws.email import Email
+
+from .assert_helpers import assert_ses_configuration_set, assert_ses_identity, assert_ses_tags
+from .export_helpers import export_email
+
+pytestmark = pytest.mark.integration
+
+
+# --- Email identity (no DNS needed) ---
+
+
+def test_email_identity_basic(stelvio_env):
+    def infra():
+        email = Email("notifications", "test-integ@example.com")
+        export_email(email)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_ses_identity(
+        "test-integ@example.com",
+        identity_type="EMAIL_ADDRESS",
+    )
+    assert outputs["email_notifications_ses_identity_arn"]
+    assert outputs["email_notifications_ses_configuration_set_arn"]
+
+
+def test_email_tags(stelvio_env):
+    def infra():
+        email = Email("tagged-email", "tagged-integ@example.com", tags={"Team": "platform"})
+        export_email(email)
+
+    outputs = stelvio_env.deploy(infra)
+    assert_ses_tags(outputs["email_tagged-email_ses_identity_arn"], {"Team": "platform"})
+    assert_ses_tags(outputs["email_tagged-email_ses_configuration_set_arn"], {"Team": "platform"})
+
+
+def test_email_identity_sandbox(stelvio_env):
+    """Smoke test: sandbox=True deploys successfully.
+
+    sandbox affects IAM link permissions (wildcard vs identity ARN),
+    which is tested at the unit level. This verifies the deploy path works.
+    """
+
+    def infra():
+        email = Email("alerts", "alerts-integ@example.com", sandbox=True)
+        export_email(email)
+
+    stelvio_env.deploy(infra)
+
+    assert_ses_identity(
+        "alerts-integ@example.com",
+        identity_type="EMAIL_ADDRESS",
+    )
+
+
+def test_email_configuration_set(stelvio_env):
+    def infra():
+        email = Email("mailer", "mailer-integ@example.com")
+        export_email(email)
+
+    outputs = stelvio_env.deploy(infra)
+
+    # Prefixed with app and env, so two apps in one account can't collide
+    name = outputs["email_mailer_ses_configuration_set_arn"].rsplit("/", 1)[1]
+    assert name.endswith("-mailer-config-set")
+    assert_ses_configuration_set(name)
+
+
+def test_email_domain_identity_dns_opted_out(stelvio_env):
+    """dns=False deploys a domain identity without a DNS provider.
+
+    The SES identity is created in pending state — user is responsible
+    for adding DKIM records to DNS externally.
+    """
+    domain = "manual-dns-integ.example.com"
+
+    def infra():
+        email = Email("manual-dns", domain, dns=False)
+        export_email(email)
+
+    outputs = stelvio_env.deploy(infra)
+
+    # SES identity exists (unverified — we never added DKIM records)
+    assert_ses_identity(domain, identity_type="DOMAIN")
+
+    # Only identity + config set ARNs exported
+    assert outputs["email_manual-dns_ses_identity_arn"]
+    assert outputs["email_manual-dns_ses_configuration_set_arn"]
+
+    # No DKIM, DMARC, or verification resources created
+    for i in range(3):
+        assert f"email_manual-dns_dkim_record_{i}_name" not in outputs
+    assert "email_manual-dns_dmarc_record_name" not in outputs
+    assert "email_manual-dns_ses_domain_verification_token_arn" not in outputs

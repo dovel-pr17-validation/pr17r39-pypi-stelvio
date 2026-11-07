@@ -1,0 +1,139 @@
+import re
+from typing import Literal
+
+VALID_LOG_RETENTION_DAYS = {
+    1,
+    3,
+    5,
+    7,
+    14,
+    30,
+    60,
+    90,
+    120,
+    150,
+    180,
+    365,
+    400,
+    545,
+    731,
+    1096,
+    1827,
+    2192,
+    2557,
+    2922,
+    3288,
+    3653,
+}
+
+DOMAIN_LABEL_MAX_LENGTH = 63
+DOMAIN_NAME_MAX_LENGTH = 253
+DOMAIN_MIN_LABELS = 2
+STAGE_NAME_MAX_LENGTH = 128
+PERMISSION_NAME_MAX_LENGTH = 100
+DEFAULT_STAGE_NAME = "$default"
+
+
+def validate_stage_name(stage_name: str) -> None:
+    if len(stage_name) > STAGE_NAME_MAX_LENGTH:
+        raise ValueError(f"Stage name must be at most {STAGE_NAME_MAX_LENGTH} characters")
+    if stage_name.startswith("$"):
+        if stage_name != "$default":
+            raise ValueError(
+                f"Stage name starting with '$' must be exactly '$default', got {stage_name!r}"
+            )
+        return
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", stage_name):
+        raise ValueError(
+            f"Stage name must contain only alphanumerics, hyphens, and underscores, "
+            f"got {stage_name!r}"
+        )
+
+
+def log_retention_in_days(value: int | Literal["forever"] | None) -> int | None:
+    # "forever" is CloudWatch's 0 (never expire), not an omitted key: an omitted key would
+    # let the Stelvio default or an app-wide customize dict replace the user's choice.
+    return 0 if value == "forever" else value
+
+
+def validate_log_retention_days(value: int | Literal["forever"] | None) -> None:
+    if value is None or value == "forever":
+        return
+    if value not in VALID_LOG_RETENTION_DAYS:
+        raise ValueError(
+            f"Invalid access_log_retention_days={value!r}. "
+            f"Must be 'forever' or one of: {sorted(VALID_LOG_RETENTION_DAYS)}"
+        )
+
+
+def validate_api_mapping_key(key: str, *, field_name: str = "api_mapping_key") -> None:
+    if not key:
+        raise ValueError(f"{field_name} cannot be empty string (use None for root mapping)")
+    if key.startswith("/") or key.endswith("/"):
+        raise ValueError(f"{field_name} must not start or end with '/', got {key!r}")
+    if "//" in key:
+        raise ValueError(f"{field_name} must not contain empty path segments (//), got {key!r}")
+
+
+def validate_domain_name(
+    value: str, *, field_name: str = "domain_name", wildcard: bool = False
+) -> None:
+    if not isinstance(value, str):
+        raise TypeError(f"{_display_name(field_name)} must be a string")
+    domain = value.strip()
+    if not domain:
+        raise ValueError(f"{_display_name(field_name)} cannot be empty")
+    if domain != value:
+        raise ValueError(f"{field_name} must not contain leading or trailing whitespace")
+    if len(domain) > DOMAIN_NAME_MAX_LENGTH:
+        raise ValueError(f"{field_name} must be at most {DOMAIN_NAME_MAX_LENGTH} characters")
+    labels = domain.rstrip(".").split(".")
+    if len(labels) < DOMAIN_MIN_LABELS:
+        raise ValueError(f"{_display_name(field_name)} must include at least one dot")
+    if wildcard and labels[0] == "*":
+        labels = labels[1:]
+        # ACM refuses `*.com` at deploy, so catch it here. This counts labels only, with no
+        # public-suffix check: `*.co.uk` passes, though no CA issues a certificate for it.
+        if len(labels) < DOMAIN_MIN_LABELS:
+            raise ValueError(
+                f"{_display_name(field_name)} wildcard must cover a domain with a dot, "
+                "like *.example.com"
+            )
+    for label in labels:
+        _validate_domain_label(label, field_name)
+
+
+def url_domain(domain: str | None) -> str | None:
+    """`domain` as a url host, or None for a wildcard: `*.example.com` names no single host."""
+    return None if domain and domain.startswith("*.") else domain
+
+
+def _validate_domain_label(label: str, field_name: str) -> None:
+    if not label:
+        raise ValueError(f"{_display_name(field_name)} must not contain empty labels")
+    if len(label) > DOMAIN_LABEL_MAX_LENGTH:
+        raise ValueError(
+            f"{field_name} labels must be at most {DOMAIN_LABEL_MAX_LENGTH} characters"
+        )
+    if label.startswith("-") or label.endswith("-"):
+        raise ValueError(f"{_display_name(field_name)} labels must not start or end with '-'")
+    if not all(char.isalnum() or char == "-" for char in label):
+        raise ValueError(
+            f"{_display_name(field_name)} labels may contain only letters, numbers, and hyphens"
+        )
+
+
+def _validate_path_param(path: str, param: str) -> None:
+    if param.endswith("+"):
+        if param != "proxy+":
+            raise ValueError("Only {proxy+} is supported for greedy paths")
+        param_pos = path.index(f"{{{param}}}")
+        if param_pos != len(path) - len(f"{{{param}}}"):
+            raise ValueError("Greedy parameter must be at the end of the path")
+        return
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", param):
+        raise ValueError(f"Invalid parameter name: {param}")
+
+
+def _display_name(field_name: str) -> str:
+    return "Domain name" if field_name == "domain_name" else field_name

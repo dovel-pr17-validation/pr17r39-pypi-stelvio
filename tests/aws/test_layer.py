@@ -1,0 +1,295 @@
+import ast
+import logging
+import re
+import shutil
+from pathlib import Path
+from unittest.mock import patch
+
+import pulumi
+import pytest
+from pulumi import AssetArchive, FileArchive
+
+from stelvio.aws._packaging.dependencies import RequirementsSpec
+from stelvio.aws.layer import Layer, LayerConfig, LayerConfigDict
+from stelvio.aws.layer.layer import _LAYER_CACHE_SUBDIR
+from stelvio.aws.types import DEFAULT_ARCHITECTURE, DEFAULT_RUNTIME
+
+from ..conftest import TP
+from .conftest import assert_hash_truncated
+from .pulumi_mocks import R
+
+logger = logging.getLogger(__name__)
+
+
+# Layer tests need a special project_cwd fixture that patches get_project_root
+# differently from the shared fixture, so we keep it local.
+@pytest.fixture
+def project_cwd(monkeypatch, pytestconfig, tmp_path):
+    rootpath = pytestconfig.rootpath
+    source_project_dir = rootpath / "tests" / "aws" / "sample_test_project"
+    temp_project_dir = tmp_path / "sample_project_copy"
+
+    shutil.copytree(source_project_dir, temp_project_dir, dirs_exist_ok=True)
+    monkeypatch.chdir(temp_project_dir)
+
+    with patch("stelvio.aws.layer.layer.get_project_root", return_value=temp_project_dir):
+        yield temp_project_dir
+
+
+@pytest.fixture
+def mock_cache_fs(tmp_path, monkeypatch):
+    dot_stelvio = tmp_path / ".stelvio"
+    layer_cache_base = dot_stelvio / "lambda_dependencies" / _LAYER_CACHE_SUBDIR
+    layer_cache_base.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "stelvio.aws._packaging.dependencies._get_lambda_dependencies_dir",
+        lambda subdir: dot_stelvio / "lambda_dependencies" / subdir,
+    )
+    monkeypatch.setattr("stelvio.project.get_dot_stelvio_dir", lambda: dot_stelvio)
+
+    return layer_cache_base
+
+
+@pytest.mark.parametrize(
+    ("code", "requirements", "arch", "runtime"),
+    [
+        ("src/my_layer_code", None, None, None),
+        (None, ["requests", "boto3"], None, None),
+        (None, "src/layer_requirements.txt", None, None),
+        ("src/my_layer_code", ["requests", "boto3"], None, None),
+        ("src/my_layer_code", "src/layer_requirements.txt", "python3.13", "arm64"),
+    ],
+    ids=[
+        "code_only",
+        "requirements_only_as_list",
+        "requirements_only_as_file",
+        "code_and_requirements_as_list",
+        "code_and_requirements_as_file_custom_runtime_and_arch",
+    ],
+)
+def test_layer_with__(  # noqa: PLR0913
+    pulumi_mocks,
+    project_cwd,
+    mock_cache_fs,
+    mock_get_or_install_dependencies_layer,
+    code,
+    requirements,
+    arch,
+    runtime,
+):
+    # Arrange
+    layer_name = "my-layer"
+    if isinstance(requirements, str):
+        requirements_abs = project_cwd / requirements
+        requirements_abs.parent.mkdir(parents=True, exist_ok=True)
+        requirements_abs.touch()
+    if code:
+        (project_cwd / code).mkdir(parents=True, exist_ok=True)
+
+    # Act
+    layer = Layer(
+        layer_name, code=code, requirements=requirements, runtime=runtime, architecture=arch
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return layer.resources
+
+    deploy()
+
+    # Assert
+    layer_args = pulumi_mocks.assert_res(
+        layer_name,
+        R.LAYER_VERSION,
+        {
+            "layerName": TP + layer_name,
+            "compatibleRuntimes": [runtime or DEFAULT_RUNTIME],
+            "compatibleArchitectures": [arch or DEFAULT_ARCHITECTURE],
+        },
+        partial=True,
+    )
+    code_archive: AssetArchive = layer_args.inputs["code"]
+    assert isinstance(code_archive, AssetArchive)
+    assert len(code_archive.assets) == bool(code) + bool(requirements)
+
+    # Check code archive
+    if code:
+        code_dir_name = Path(code).name
+        expected_code_key = f"python/{code_dir_name}"
+        assert expected_code_key in code_archive.assets
+        code_archive_asset = code_archive.assets[expected_code_key]
+        assert isinstance(code_archive_asset, FileArchive)
+        assert code_archive_asset.path == str(project_cwd / code)
+
+    if not requirements:
+        mock_get_or_install_dependencies_layer.assert_not_called()
+        return
+
+    mock_get_or_install_dependencies_layer.assert_called_once_with(
+        requirements_source=RequirementsSpec(
+            content="\n".join(requirements) if isinstance(requirements, list) else None,
+            path_from_root=Path(requirements) if isinstance(requirements, str) else None,
+        ),
+        runtime=runtime or DEFAULT_RUNTIME,
+        architecture=arch or DEFAULT_ARCHITECTURE,
+        project_root=project_cwd,
+        log_context=f"Layer: {layer_name}",
+        cache_subdirectory=_LAYER_CACHE_SUBDIR,
+    )
+
+    # Check dependencies archive
+    expected_depencencies_key = f"python/lib/{runtime or DEFAULT_RUNTIME}/site-packages"
+    assert expected_depencencies_key in code_archive.assets
+    dependencies_archive_asset = code_archive.assets[expected_depencencies_key]
+    assert isinstance(dependencies_archive_asset, FileArchive)
+    assert dependencies_archive_asset.path == str(
+        mock_get_or_install_dependencies_layer.return_value
+    )
+
+
+@pytest.mark.parametrize(
+    ("opts", "error_type", "error_match"),
+    [
+        ({}, ValueError, "must specify 'code' and/or 'requirements'"),
+        (
+            {"requirements": [1, True]},
+            TypeError,
+            "If 'requirements' is a list, all its elements must be strings.",
+        ),
+        (
+            {"requirements": True},
+            TypeError,
+            re.escape("'requirements' must be a string (path), list of strings, or None."),
+        ),
+        (
+            {"code": "functions", "requirements": ""},
+            ValueError,
+            re.escape("If 'requirements' is a string (path), it cannot be empty."),
+        ),
+        (
+            {"requirements": " "},
+            ValueError,
+            re.escape("If 'requirements' is a string (path), it cannot be empty."),
+        ),
+        ({"requirements": "nonexistent.txt"}, FileNotFoundError, "Requirements file not found"),
+        ({"requirements": "functions"}, ValueError, "Requirements path is not a file"),
+        ({"code": "functions/simple.py"}, ValueError, "is not a directory"),
+        ({"code": "src/non-existent-folder"}, ValueError, "is not a directory"),
+        ({"code": "../outside-folder/"}, ValueError, "which is outside the project root"),
+        (
+            {"requirements": "../outside-folder/file.txt"},
+            ValueError,
+            "which is outside the project root",
+        ),
+    ],
+    ids=[
+        "no_code_or_requirements",
+        "requirements_list_not_strings",
+        "requirements_not_list_or_str_or_none",
+        "requirements_empty_string",
+        "requirements_blank_string",
+        "requirements_path_does_not_exist",
+        "requirements_path_is_folder",
+        "code_path_is_not_a_folder",
+        "code_path_does_not_exist",
+        "code_path_outside_of_project_root",
+        "requirements_path_outside_of_project_root",
+    ],
+)
+def test_layer_raises_when__(project_cwd, opts, error_type, error_match):
+    # Arrange
+    outside_folder = project_cwd / "../outside-folder"
+    outside_folder.mkdir(parents=True)
+    outside_file = outside_folder / "file.txt"
+    outside_file.touch()
+    # Act & Assert
+    with pytest.raises(error_type, match=error_match):
+        _ = Layer(name="my-layer", **opts).resources
+
+
+def test_layer_customize_layer_version_resource(
+    pulumi_mocks, project_cwd, mock_cache_fs, mock_get_or_install_dependencies_layer
+):
+    """Test that customize parameter is applied to Lambda layer version resource."""
+    # Arrange
+    code_path = "src/my_layer_code"
+    (project_cwd / code_path).mkdir(parents=True, exist_ok=True)
+
+    layer = Layer(
+        "custom-layer",
+        code=code_path,
+        customize={
+            "layer_version": {
+                "description": "Custom layer description",
+            }
+        },
+    )
+
+    # Act
+    @pulumi.runtime.test
+    def deploy():
+        return layer.resources
+
+    deploy()
+
+    # Assert
+    pulumi_mocks.assert_res(
+        "custom-layer",
+        R.LAYER_VERSION,
+        {"description": "Custom layer description"},
+        partial=True,
+    )
+
+
+def test_layer_rejects_component_tags(project_cwd):
+    code_path = "src/my_layer_code"
+    (project_cwd / code_path).mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'tags'"):
+        Layer("tagged-layer", code=code_path, tags={"Team": "platform"})  # type: ignore[call-arg]
+
+
+def test_layer_config_dict_matches_dataclass():
+    """Test that LayerConfigDict matches LayerConfig."""
+    from tests.test_utils import assert_config_dict_matches_dataclass
+
+    assert_config_dict_matches_dataclass(LayerConfig, LayerConfigDict)
+
+
+def test_layer_long_name_truncates_at_attach_limit(
+    pulumi_mocks, project_cwd, mock_cache_fs, mock_get_or_install_dependencies_layer
+):
+    (project_cwd / "src/layer_code").mkdir(parents=True)
+
+    @pulumi.runtime.test
+    def deploy():
+        return Layer("l" * 100, code="src/layer_code").resources
+
+    deploy()
+
+    [layer] = pulumi_mocks.created(R.LAYER_VERSION)
+    assert_hash_truncated(layer.inputs["layerName"], 80)  # version ARN must fit CreateFunction
+    assert layer.name == layer.inputs["layerName"]
+
+
+def test_layer_module_does_not_import_the_function_package():
+    """`from stelvio.aws.layer import Layer` as the first Stelvio import must work. The function
+    package's __init__ loads config, which imports layer, so any top-level import of
+    `stelvio.aws.function` here closes that loop into a half-loaded layer module. A static
+    check keeps this fast: the real thing takes a fresh interpreter. Top-level statements
+    only: a function-local import is the accepted way to break a cycle, and a module-level
+    `try`/`if` around an import is not a shape this package uses. The package `__init__`
+    only re-exports, so the check reads the implementation module."""
+    import stelvio.aws.layer.layer
+
+    tree = ast.parse(Path(stelvio.aws.layer.layer.__file__).read_text())
+    imported = [
+        ".".join(p for p in ("stelvio.aws" if node.level else "", node.module, alias.name) if p)
+        if isinstance(node, ast.ImportFrom)
+        else alias.name
+        for node in tree.body
+        if isinstance(node, ast.Import | ast.ImportFrom)
+        for alias in node.names
+    ]
+    assert not [name for name in imported if name.startswith("stelvio.aws.function")]

@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, final
+
+from stelvio.component import ComponentRegistry
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from pulumi import Input
+
+    from stelvio.aws.permission import AwsPermission
+    from stelvio.aws.vpc import Vpc
+    from stelvio.component import Component
+
+
+# This protocol is not strictly needed as in Link we use AwsPermission directly, and later we'll
+# use union types e.g. AwsPermission | GcpPermission, but I keep it here for reference and for
+# letting people know any new permission types should have to_provider_format method.
+@dataclass
+class Permission(Protocol):
+    def to_provider_format(self) -> Any:  # noqa: ANN401
+        """Convert permission to a provider-specific format."""
+        ...
+
+
+type ConfigureLink = Callable[[Any], tuple[dict, list[Permission] | Permission]]
+
+
+# Link has permissions, and each permission has actions and resources,
+# so permission represents part of statement
+@final
+@dataclass(frozen=True)
+class LinkConfig:
+    properties: dict[str, Input[str]] | None = None
+    permissions: list[AwsPermission] | None = None
+    # Internal; zip dest → absolute local path; for link creators only.
+    _files: dict[str, str | Path] | None = None
+
+
+@final
+@dataclass(frozen=True)
+class Link:
+    name: str
+    properties: dict[str, Input[str]] | None
+    permissions: list[Permission] | None
+    component: Component | None = None
+    # Internal; zip dest → absolute local path; for link creators only.
+    _files: dict[str, str | Path] | None = None
+
+    def link(self) -> Link:
+        return self
+
+    def with_config(
+        self,
+        *,
+        properties: dict[str, Input[str]] | None = None,
+        permissions: list[Permission] | None = None,
+    ) -> Link:
+        """Replace both properties and permissions at once."""
+        return Link(
+            name=self.name,
+            properties=properties,
+            permissions=permissions,
+            component=self.component,
+            _files=self._files,
+        )
+
+    def with_properties(self, **props: Input[str]) -> Link:
+        """Replace all properties."""
+        return Link(
+            name=self.name,
+            properties=props,
+            permissions=self.permissions,
+            component=self.component,
+            _files=self._files,
+        )
+
+    def with_permissions(self, *permissions: Permission) -> Link:
+        """Replace all permissions."""
+        return Link(
+            name=self.name,
+            properties=self.properties,
+            permissions=list(permissions),
+            component=self.component,
+            _files=self._files,
+        )
+
+    def add_properties(self, **extra_props: Input[str]) -> Link:
+        """Add to existing properties."""
+        new_props = {**(self.properties or {}), **extra_props}
+        return self.with_properties(**new_props)
+
+    def add_permissions(self, *extra_permissions: Permission) -> Link:
+        """Add to existing permissions."""
+        current = self.permissions or []
+        return self.with_permissions(*(current + list(extra_permissions)))
+
+    def remove_properties(self, *keys: str) -> Link:
+        """Remove specific properties by key."""
+        if not self.properties:
+            return self
+
+        new_props = {k: v for k, v in self.properties.items() if k not in keys}
+        return self.with_properties(**new_props)
+
+
+class Linkable(Protocol):
+    def link(self) -> Link: ...
+
+
+class LinkableMixin:
+    @property
+    def _link_vpc(self) -> Vpc | None:
+        """Vpc a linked Function must join to reach this component, or None.
+
+        Read when the Function is constructed, before any resources exist, so an
+        override must not touch `.resources` or the link creator.
+        """
+        return None
+
+    def link(self: Component) -> Link:
+        link_creator_ = ComponentRegistry.get_link_config_creator(type(self))
+        if link_creator_ is None:
+            kind = type(self).__name__
+            raise TypeError(
+                f"{kind} has no registered link creator - add @link_config_creator({kind})"
+            )
+        link_config = link_creator_(self)
+        return Link(
+            self.name,
+            link_config.properties,
+            link_config.permissions,
+            component=self,
+            _files=link_config._files,  # noqa: SLF001
+        )

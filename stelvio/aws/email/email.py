@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Literal, Required, TypedDict, Unpack, final
+
+import pulumi_aws
+
+from stelvio import context
+from stelvio.aws.permission import AwsPermission
+from stelvio.component import Component, link_config_creator, parse_config, resource_name
+from stelvio.dns import Dns, DnsProviderNotConfiguredError, Record
+from stelvio.link import LinkableMixin, LinkConfig
+from stelvio.provider import ProviderStore
+
+if TYPE_CHECKING:
+    from pulumi_aws.ses import DomainIdentityVerificationArgs
+    from pulumi_aws.sesv2 import (
+        ConfigurationSetArgs,
+        ConfigurationSetEventDestinationArgs,
+        EmailIdentityArgs,
+    )
+
+    from stelvio.customize import Customization, CustomizationNoArgs
+
+MAX_CONFIGURATION_SET_NAME_LENGTH = 64
+
+__all__ = [
+    "Email",
+    "EmailConfig",
+    "EmailConfigDict",
+    "EmailResources",
+    "EventConfiguration",
+    "EventType",
+]
+
+EventType = Literal[
+    "send",
+    "reject",
+    "bounce",
+    "complaint",
+    "delivery",
+    "delivery-delay",
+    "rendering-failure",
+    "subscription",
+    "open",
+    "click",
+]
+
+
+@final
+@dataclass(frozen=True, kw_only=True)
+class EmailResources:
+    identity: pulumi_aws.sesv2.EmailIdentity
+    configuration_set: pulumi_aws.sesv2.ConfigurationSet | None = None
+    dkim_records: list[Record] | None = None
+    dmarc_record: Record | None = None
+    verification: pulumi_aws.ses.DomainIdentityVerification | None = None
+    event_destinations: list[pulumi_aws.sesv2.ConfigurationSetEventDestination] | None = None
+
+
+class EmailCustomizationDict(TypedDict, total=False):
+    identity: Customization[EmailIdentityArgs]
+    configuration_set: Customization[ConfigurationSetArgs]
+    dkim_records: CustomizationNoArgs  # no pulumi args here because cross cloud compat
+    dmarc_record: CustomizationNoArgs  # no pulumi args here because cross cloud compat
+    verification: Customization[DomainIdentityVerificationArgs]
+    event_destinations: Customization[ConfigurationSetEventDestinationArgs]
+
+
+class EventConfiguration(TypedDict, total=False):
+    name: Required[str]
+    types: Required[list[EventType]]
+    topic_arn: Required[str]
+
+
+class EmailConfigDict(TypedDict, total=False):
+    """Dictionary configuration for the Email component."""
+
+    sender: str
+    dmarc: str | None | Literal[False]
+    events: list[EventConfiguration] | None
+    sandbox: bool
+    dns: Dns | Literal[False] | None
+
+
+@final
+@dataclass(frozen=True, kw_only=True)
+class EmailConfig:
+    """Typed configuration for the Email component."""
+
+    sender: str
+    dmarc: str | None | Literal[False] = None
+    events: list[EventConfiguration] | None = None
+    sandbox: bool = False
+    dns: Dns | Literal[False] | None = None
+
+
+@final
+class Email(Component[EmailResources, EmailCustomizationDict], LinkableMixin):
+    _config: EmailConfig
+
+    def __init__(
+        self,
+        name: str,
+        config: EmailConfig | EmailConfigDict | str | None = None,
+        *,
+        tags: dict[str, str] | None = None,
+        customize: EmailCustomizationDict | None = None,
+        **opts: Unpack[EmailConfigDict],
+    ):
+        super().__init__(
+            ProviderStore.aws(), "stelvio:aws:Email", name, tags=tags, customize=customize
+        )
+        self._config = self._parse_config(config, opts)
+        self.is_domain = "@" not in self.config.sender
+        # We allow passing in a DNS provider since email verification may
+        # need another DNS provider than the one in context. Pass dns=False
+        # to opt out of Stelvio managing DNS records for this email entirely
+        # (DKIM, DMARC and domain verification are skipped — you handle them).
+        dns_opted_out = self.config.dns is False
+
+        if dns_opted_out:
+            self.dns = None
+        elif self.config.dns is None:
+            self.dns = context().dns
+        else:
+            self.dns = self.config.dns
+
+        if self.config.dmarc and not self.is_domain:
+            raise ValueError("DMARC can only be set for domain email identities.")
+        if self.config.dmarc and not self.dns and not dns_opted_out:
+            raise DnsProviderNotConfiguredError(
+                "DNS provider must be configured to set DMARC records."
+            )
+        if self.is_domain and not self.dns and not dns_opted_out:
+            raise DnsProviderNotConfiguredError(
+                "DNS provider must be configured to create domain email identity."
+            )
+        if self.is_domain:
+            self.check_domain(self.config.sender)
+        else:
+            self.check_email(self.config.sender)
+
+    @property
+    def config(self) -> EmailConfig:
+        """Get the component configuration."""
+        return self._config
+
+    @property
+    def sender(self) -> str:
+        return self.config.sender
+
+    @property
+    def dmarc(self) -> str | None:
+        return self.config.dmarc
+
+    @property
+    def events(self) -> list[EventConfiguration] | None:
+        return self.config.events
+
+    @property
+    def sandbox(self) -> bool:
+        return self.config.sandbox
+
+    @staticmethod
+    def _parse_config(
+        config: EmailConfig | EmailConfigDict | str | None, opts: EmailConfigDict
+    ) -> EmailConfig:
+        if isinstance(config, str):  # bare sender shorthand: Email("mail", "me@example.com")
+            opts["sender"] = config
+            config = None
+        config = parse_config(EmailConfig, config, opts)
+        # dmarc=False means "no DMARC", stored as None. Domains get a default DMARC record
+        # unless the user set one or opted out of DNS — no record can be created then.
+        if config.dmarc is False:
+            config = replace(config, dmarc=None)
+        elif (
+            config.dmarc is None
+            and config.sender
+            and "@" not in config.sender
+            and config.dns is not False
+        ):
+            config = replace(config, dmarc="v=DMARC1; p=none;")
+        return config
+
+    def check_domain(self, domain: str) -> None:
+        """
+        Checks if the domain is a valid domain.
+        """
+        if not isinstance(domain, str) or "." not in domain:
+            raise ValueError(f"Invalid domain: {domain}")
+
+    def check_email(self, email: str) -> None:
+        """
+        Checks if the email is a valid email.
+        """
+        if not isinstance(email, str) or "@" not in email:
+            raise ValueError(f"Invalid email: {email}")
+
+    def _create_resources(self) -> EmailResources:
+        configuration_set = pulumi_aws.sesv2.ConfigurationSet(
+            **self._customizer(
+                "configuration_set",
+                {},
+                {
+                    "resource_name": context().prefix(f"{self.name}-config-set"),
+                    "configuration_set_name": resource_name(
+                        f"{self.name}-config-set",
+                        limit=MAX_CONFIGURATION_SET_NAME_LENGTH,
+                        pulumi_suffix_length=0,
+                    ),
+                },
+                inject_tags=True,
+            ),
+            opts=self._resource_opts(),
+        )
+
+        identity = pulumi_aws.sesv2.EmailIdentity(
+            **self._customizer(
+                "identity",
+                {"email_identity": self.sender},
+                {
+                    "resource_name": context().prefix(f"{self.name}-identity"),
+                    "configuration_set_name": configuration_set.configuration_set_name,
+                },
+                inject_tags=True,
+            ),
+            opts=self._resource_opts(),
+        )
+
+        dkim_records = None
+        dmarc_record = None
+        verification = None
+        if self.is_domain and self.dns:
+            dkim_records = []
+            # SES always returns 3 tokens
+            for i in range(3):
+                token = identity.dkim_signing_attributes.apply(
+                    lambda attrs, i=i: attrs["tokens"][i]
+                )
+                record = self.dns.create_record(
+                    resource_name=context().prefix(f"{self.name}-dkim-record-{i}"),
+                    **self._customizer(
+                        "dkim_records",
+                        {},
+                        default_props={
+                            "name": token.apply(lambda t: f"{t}._domainkey.{self.sender}"),
+                            "value": token.apply(lambda t: f"{t}.dkim.amazonses.com"),
+                            "record_type": "CNAME",
+                            "ttl": 600,
+                        },
+                    ),
+                    opts=self._resource_opts(),
+                )
+                dkim_records.append(record)
+
+            if self.dmarc:
+                dmarc_record = self.dns.create_record(
+                    resource_name=context().prefix(f"{self.name}-dmarc-record"),
+                    name=f"_dmarc.{self.sender}",
+                    **self._customizer(
+                        "dmarc_record",
+                        {
+                            "value": self.dmarc,
+                        },
+                        default_props={
+                            "record_type": "TXT",
+                            "ttl": 600,
+                        },
+                    ),
+                    opts=self._resource_opts(),
+                )
+            verification = pulumi_aws.ses.DomainIdentityVerification(
+                resource_name=context().prefix(f"{self.name}-identity-verification"),
+                **self._customizer(
+                    "verification",
+                    {},
+                    {
+                        "domain": identity.email_identity,
+                    },
+                ),
+                opts=self._resource_opts(depends_on=[identity]),
+            )
+        event_destinations = []
+        if self.events:
+            for event in self.events:
+                event_destination = pulumi_aws.sesv2.ConfigurationSetEventDestination(
+                    resource_name=context().prefix(f"{self.name}-event-{event['name']}"),
+                    **self._customizer(
+                        "event_destinations",
+                        {
+                            "event_destination_name": event["name"],
+                            "event_destination": pulumi_aws.sesv2.ConfigurationSetEventDestinationEventDestinationArgs(  # noqa: E501
+                                enabled=True,
+                                matching_event_types=event["types"],
+                                sns_destination=pulumi_aws.sesv2.ConfigurationSetEventDestinationEventDestinationSnsDestinationArgs(
+                                    topic_arn=event["topic_arn"]
+                                ),
+                            ),
+                        },
+                        {"configuration_set_name": configuration_set.configuration_set_name},
+                    ),
+                    opts=self._resource_opts(),
+                )
+                event_destinations.append(event_destination)
+
+        return EmailResources(
+            identity=identity,
+            configuration_set=configuration_set,
+            dkim_records=dkim_records,
+            dmarc_record=dmarc_record,
+            verification=verification,
+            event_destinations=event_destinations,
+        )
+
+
+@link_config_creator(Email)
+def default_email_link(
+    email: Email,
+) -> LinkConfig:
+    identity = email.resources.identity
+    configuration_set = email.resources.configuration_set
+    sandbox = email.sandbox
+    return LinkConfig(
+        properties={
+            "email_identity_sender": identity.email_identity,
+            "email_identity_arn": identity.arn,
+            "configuration_set_name": configuration_set.configuration_set_name,
+            "configuration_set_arn": configuration_set.arn,
+        },
+        permissions=[
+            AwsPermission(
+                actions=["ses:SendEmail", "ses:SendRawEmail", "ses:SendTemplatedEmail"],
+                resources=[identity.arn if not sandbox else "*"],
+            ),
+        ],
+    )

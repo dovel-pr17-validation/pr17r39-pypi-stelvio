@@ -1,0 +1,731 @@
+# Traforo testing
+
+Python tests validate helper requests, reply framing, descriptor handling,
+installation transactions, and forwarder control messages. They do not compile Go.
+The Go module owns the forwarder and helper implementations.
+
+## AWS transport and discovery
+
+The transport tests use deterministic AWS SDK responses and local loopback SOCKS
+peers. They verify captured credential isolation, deployed VPC and bastion
+ownership, persistent first-connect SSH host identity,
+DocumentDB cluster/member discovery, error classification, and cleanup of partial
+SSM/SSH startup. They do not deploy AWS resources or change host routes, resolver
+files, or helper state.
+
+Run the focused suite with:
+
+```bash
+uv run pytest \
+  tests/tunnel/test_aws_inventory.py \
+  tests/tunnel/test_credentials.py \
+  tests/tunnel/test_discovery.py \
+  tests/tunnel/test_socks.py \
+  tests/tunnel/test_transport.py \
+  tests/tunnel/test_host_trust.py -q
+```
+
+The inventory regressions require an exact response for all declared public,
+private, and isolated subnet IDs. They reject missing, duplicate, extra, changed,
+or unavailable records and subnets outside the live VPC associations. Tests also
+cover changing associations, secondary-block subnets, reversed API order, a
+ten-AZ layout with 30 subnet records and 20 route destinations, and public-only
+metadata with no route fallback. Disabled and unused VPCs request no inventory.
+
+`VpcNetwork.cidrs` retains full AWS ownership blocks, with the verified primary
+block first for resolver selection. `route_cidrs` preserves only the deployed
+private and isolated subnet CIDRs. Tests keep full-VPC overlap rejection even
+when the selected routes are disjoint. They use Botocore Stubber with exact
+request parameters, not live AWS calls. Session wiring must use `route_cidrs` for
+helper and packet configuration while keeping the owning resolver separate.
+
+The Session Manager plugin must already be available through the verified private
+cache for a live connection. Tests stub its selected path and never download or
+run the plugin. A missing or unsafe plugin is a terminal local artifact error;
+repair it through the existing installation command before retrying AWS transport.
+
+The host-trust tests use isolated temporary caches. They cover independent AWS
+identities, persistence, concurrent first connections, rejected key changes,
+unsafe files, failed atomic publication, bounded locking, and explicit reset.
+Transport tests verify that failed authentication does not publish a pin and that
+new transport objects reuse it. No custom SSM Command document or Run Command
+permission is required. The Session Manager plugin remains required.
+
+Run real OpenSSH interoperability on macOS without AWS or privileged host changes:
+
+```bash
+STLV_TEST_SSH_INTEROP=1 uv run pytest tests/tunnel/test_transport.py -k actual_openssh -q
+```
+
+The test starts a temporary loopback-only sshd and a test-owned replacement for the
+SSM byte stream. It checks successful authentication, persistent key reuse,
+key-change rejection by a new transport, and explicit trust reset. It restores
+its processes and temporary files. It does not establish live SSM acceptance.
+
+## Shared session and isolated runtime
+
+`test_supervisor.py` exercises independent VPC workers with deterministic
+transport, helper, DNS, and discovery adapters. It covers generation advancement
+after retained DNS cleanup, stable listener ports, stale control rejection,
+DNS rejection and recovery, terminal local-artifact and SSH host-key failures, and retained helper
+evidence when transport cleanup is uncertain. Readiness checks require the VPC
+DNS path and resource addresses as well as a live SOCKS transport.
+
+Host-key regressions cover refusal before forwarding and after an established
+connection fails. They require no further retries, retained DNS rejection, and
+blocked dependent invocations while unrelated endpoints remain available. Status
+diagnostics are bounded and reject control characters. A fresh Python process
+must reuse the persisted host pin and cannot replace it with another key.
+
+`test_wire.py`, `test_runtime.py`, `test_dev_session.py`, and `test_evidence.py`
+cover bounded IPC framing, session metadata validation, captured environment
+isolation in a real child process, parent/lease death, bounded status and shutdown,
+admission freshness, no-op sessions, and durable SSM ownership receipts. The
+ordinary child-process tests use local fixtures only. They do not deploy AWS
+resources, install the helper, or mutate host networking. The optional
+`STLV_TEST_TRAFORO_IMAGE` lane is separate and exercises Python/Go interoperability
+with a previously verified image.
+
+Run the focused session suite with:
+
+```bash
+uv run pytest \
+  tests/tunnel/test_wire.py \
+  tests/tunnel/test_evidence.py \
+  tests/tunnel/test_supervisor.py \
+  tests/tunnel/test_runtime.py \
+  tests/tunnel/test_dev_session.py -q
+```
+
+`test_standalone.py` checks the standalone command lifecycle. Its trust scenarios
+use the real CLI, shared session, and SSH transport with deterministic AWS/SSH
+boundaries. Each run creates a new session and transport. The tests verify pin
+reuse, repeated changed-key refusal, actionable diagnostics, original-key
+restoration, and explicit reset with confirmation. Shared fixtures live in
+`tests/tunnel/conftest.py`; the separate OpenSSH test checks the real SSH behavior.
+
+The opt-in AWS standalone scenario also compares pins across normal exit,
+restart, and SIGKILL. It rotates a proof-owned bastion key, requires two fresh
+commands to reject it, restores the original key, and checks database access.
+Fault commands require test-only Run Command access to `AWS-RunShellScript`.
+Production tunneling does not need this permission. The fault helper checks
+instance ownership before each command and retains uncertainty if execution
+cannot be certified; it does not race a restoration command against unknown work.
+
+The fixture refuses pre-existing pins for proof instances. After independent AWS
+absence is certified, it removes only pins claimed for the proof deployment.
+Per-identity lock files remain in place. Unit tests cover pin ownership, foreign
+instance refusal, command uncertainty, and cleanup ordering. Live AWS acceptance
+is pending until this explicitly enabled lane is run.
+
+`tests/test_cli_dev.py` and `tests/bridge/test_dev_admission.py` verify that `stlv dev`
+captures the session before deployment cleanup, starts networking before AppSync,
+closes ownership after bridge exit, and rejects expired or unavailable dependent
+invocations before handler dispatch. Function tests verify that rejection happens
+before importing user code. Non-VPC dispatch remains available.
+
+The dev-command scenario in `test_standalone.py` first pins a key through
+standalone mode, then runs fresh dev commands through the real shared session,
+SSH transport, and bridge admission code with controlled external boundaries.
+It checks that changed keys block dependent handler dispatch across restarts,
+ordinary handlers still run, diagnostics include fingerprints and reset guidance,
+and the original key works again in a fresh session. It does not contact AWS or
+start AppSync.
+
+Run the focused dev integration checks with:
+
+```bash
+uv run pytest \
+  tests/test_cli_dev.py \
+  tests/bridge/test_dev_admission.py \
+  tests/aws/function/test_function_dev_mode.py \
+  tests/tunnel/test_dev_session.py -q
+```
+
+## Dev mode AWS acceptance
+
+The opt-in dev scenario uses public Function URLs to reach local handlers. Its proof
+app combines `bastion=True`, `bastion={}`, a disabled-bastion VPC, and a non-VPC
+Function. The DocumentDB handlers verify TLS, member discovery, and reads/writes
+using distinct markers that are checked against both databases. The test stops one
+bastion, requires the structured `VpcUnavailableError` before handler import,
+confirms the peer and independent endpoints remain usable, then waits for both the
+advanced helper generation and a fresh network-ready report before retrying.
+Within one command, observed generations must never decrease. Recovery can need several
+attempts: after the first activation, each configured failure and retry advances
+two more generations. The observer requires a fresh ready report and a valid
+retirement/activation cycle in the same log snapshot, within one timeout. It does not require a
+single attempt. The scenario also
+rotates the proof-owned bastion SSH host key, checks terminal `ssh-host-key`
+admission failure and DNS `SERVFAIL`, and restarts dev mode while the changed key
+is still present. The new command must reject the same key and retain the original
+pin while independent endpoints remain usable. The test restores the original key
+and starts a fresh session to verify recovery. SIGINT and SIGKILL cleanup,
+restart, SSM termination, retained bastions,
+stable resolver ports, and unchanged deployment state are checked as well.
+
+A separate opt-in case invokes a real non-VPC Function URL while the helper is
+uninstalled. The exclusive `macos_host` fixture restores the exact helper image
+captured before the run.
+
+This lane deploys a three-VPC proof app (two bastion-enabled VPCs and one disabled
+VPC) and changes host networking. It requires an authorized AWS profile and
+expected account, macOS 15 or later, an installed helper, an idle host, and no
+parallel test workers:
+
+```bash
+STLV_TEST_AWS_PROFILE=<authorized-profile> \
+STLV_TEST_TUNNEL_AWS_ACCOUNT=<expected-account-id> \
+uv run pytest \
+  tests/integration/test_tunnel.py \
+  --integration-macos-privileged --integration-tunnel -n 0 -q
+```
+
+The fixtures check the account before deployment. Dev and standalone acceptance
+share the guarded, nonce-owned host-key rotation fixture described above. Unknown
+Run Command outcomes stop further fault commands and require proof teardown;
+they do not trigger a racing restoration. The non-VPC case
+temporarily uninstalls the helper and lets `macos_host` restore the original bytes.
+The AWS fixture destroys each proof app only after helper cleanup is certified.
+These tests are separate from `tests/integration/run_all.sh` and remain pending
+until explicitly authorized and run.
+
+## Unit tests
+
+The CLI teardown unit tests use a temporary helper path and explicit VPC policy.
+They cover both helper presence and absence without an installed helper or macOS.
+An absent helper permits non-VPC teardown only; active or uncertain helper state
+blocks destruction and trust-record removal. These checks do not change host networking.
+
+Run the Python tunnel suite with the normal repository checks:
+
+```bash
+uv run pytest tests/tunnel -q
+```
+
+Host-mutating tests use the `integration_macos_privileged` marker. They skip in
+ordinary runs and in `tests/integration/run_all.sh`. Tests that need a binary use
+the checksum-verified image selected by the asset module.
+
+## Subnet protocol and conflict diagnostics
+
+`test_helper_protocol.py` checks 1, 8, 20, and 32 selected subnet ranges without
+expanding them to a VPC block. Empty and oversized sets are rejected. A request
+with 32 longest ranges and 64 longest DNS names has a 17,020-byte body, below the
+32,768-byte limit. The independent shared wire fixtures remain unchanged.
+
+`test_helper_client.py` sends actual socket replies with the fixed 26-byte route
+conflict vector also checked by Go. It verifies both route labels, the interface
+index, the configure stage, and uncertain status. Truncated, extended, unknown,
+or wrong-status diagnostics fail closed. Received descriptors are closed on both
+valid and malformed failure replies. Noncontiguous kernel masks are displayed
+as addresses and masks instead of being interpreted as IPv4 host masks.
+
+These are nonprivileged Python protocol tests. Go owns route conflict detection
+and the encoder. They do not compile Go, install a helper, or change host routes.
+Native routing and conflict acceptance require the separate privileged tier.
+
+## Unprivileged forwarder smoke test
+
+The optional smoke test starts the installed, verified Traforo image as the current
+nonroot user. It uses loopback SOCKS and DNS fixtures and a datagram socket pair.
+It does not contact the helper, install software, or change host routes or resolvers.
+
+```bash
+STLV_TEST_TRAFORO_FORWARDER=1 uv run pytest \
+  tests/tunnel/test_forwarding.py -k verified_nonroot -q
+```
+
+Run it on macOS after `stlv tunnel install` has installed the image selected by
+`STLV_TRAFORO_DEV_BINARY` or the pinned release. The installed image must match the
+selected digest. The test never downloads or builds a binary.
+
+The `test_verified_nonroot_forwarder_dns_reject_servfail_and_reconfigure` case
+uses independent DNS wire queries over UDP and TCP. It verifies successful
+forwarding, `SERVFAIL` while the view is rejected, no rejected query reaching the
+upstream, recovery on a higher DNS revision, and a stable listener port.
+
+## Privileged macOS acceptance
+
+This lane can install or replace the helper and changes routes, interfaces, and
+scoped resolver files while it runs. It needs macOS 15 or later, an ordinary user,
+administrator authorization, and exclusive access to the host. It must run without
+xdist workers and without another integration tier:
+
+```bash
+uv run pytest tests/integration/test_tunnel_host.py \
+  tests/integration/test_tunnel_dns.py \
+  --integration-macos-privileged -n 0 -q
+```
+
+Standalone AWS acceptance is a separate exclusive lane. It deploys a disposable
+proof app with ordinary `stlv deploy`, then exercises only `stlv tunnel start`:
+
+```bash
+STLV_TEST_AWS_PROFILE=<authorized-profile> \
+STLV_TEST_TUNNEL_AWS_ACCOUNT=<expected-account-id> \
+uv run pytest tests/integration/test_tunnel.py \
+  --integration-macos-privileged --integration-tunnel -n 0 -q
+```
+
+The fixture checks the caller account before deployment and destroys only its proof
+app during teardown. Acceptance covers DocumentDB TLS, member discovery and
+read/write; transport recovery while another VPC remains available; and graceful
+and abrupt standalone shutdown with helper, SSM, deployment, bastion, and host
+baseline checks. This lane is not part of `tests/integration/run_all.sh`. Do not run
+it without explicit authorization for the AWS resources and privileged host changes.
+
+The session fixture records the current helper and host baseline, refuses active or
+uncertain state, and restores the original helper during teardown. It compares
+resolver files, DNS state, routes, interfaces, and networking processes. Stop if
+preflight or teardown cannot prove ownership and restoration. Do not delete retained
+helper journals or resolver files by hand.
+
+The native DNS outage case first resolves an observed test-owned name through the
+ordinary macOS resolver and releases that observation before rejecting the view.
+During rejection it checks direct UDP and TCP `SERVFAIL` responses from the retained
+relay, a failed fresh OS lookup, the unchanged scoped resolver endpoint, and no new
+upstream requests. Those checks prove the active resolver remains scoped while
+failing closed; they do not claim to observe the OS query itself. Recovery uses a
+fresh revision and verifies the same relay port and a successful observed OS lookup.
+
+The host fixture accepts only the validated persistent
+`/Library/PrivilegedHelperTools/.stelvio-traforo.admin.lock`. It checks that the
+lock remains the same inode across administration, and treats transaction files or
+unknown matching artifacts as a preflight or recovery failure.
+
+The distinct-candidate upgrade case needs a verified candidate supplied through
+`STLV_TRAFORO_DEV_BINARY`. Build and validate a local candidate without installation
+or release publication:
+
+```bash
+make -C pkg/traforo-client-go build
+```
+
+The builder checks both release architectures, writes provenance, and prints the
+host image path for explicit selection. The default builder command installs that
+image through the existing authorized transaction. Do not use it in a build-only
+lane.
+
+Distribution acceptance uses prebuilt archive paths. Build them outside pytest:
+
+```bash
+DIST_DIR="$(mktemp -d)"
+uv build --out-dir "$DIST_DIR"
+STLV_TEST_STELVIO_WHEEL="$(find "$DIST_DIR" -name '*.whl' -print -quit)" \
+STLV_TEST_STELVIO_SDIST="$(find "$DIST_DIR" -name '*.tar.gz' -print -quit)" \
+  uv run pytest tests/tunnel/test_distribution_acceptance.py -q
+```
+
+The suite checks archive contents and installs the wheel into a clean virtual
+environment outside the checkout. It verifies the installed CLI command set,
+checks `tunnel status --help`, and rejects the unsupported `tunnel inspect`
+command. It also checks `tunnel trust --help` and the identity selectors in
+`tunnel trust reset --help`. Standalone help must show the optional environment
+argument in `tunnel start --help`. These CLI checks do not start a session,
+reset trust, contact the helper, or access AWS. Pytest does not build Go or Python
+artifacts.
+Distinct-candidate upgrade acceptance remains pending until its candidate and the
+required native authorization are available.
+
+## Native fixture subnet selection
+
+Native DNS and lifecycle fixtures own `10.254.0.0/16` and `10.253.0.0/16`, but
+route only each VPC's `.9.0/24` subnet. The helper and packet forwarder receive
+the same selected destinations, including after generation changes. The test-only
+packet view supplies those destinations to both client API shapes in this stack;
+DNS configuration retains the ownership block to select the resolver at `.0.2`.
+
+Resolver probes use SOCKS. Named database probes use both SOCKS and ordinary host
+TCP, and the fixtures also exchange payloads through the packet carrier. Do not
+add a host route for the VPC resolver to make a readiness check pass.
+
+`tests/tunnel/test_native_network_fixture.py` checks both VPC ranges, resolver
+exclusion, database inclusion, helper request encoding and forwarder controls
+without root access or Go compilation. The 100-cycle lifecycle and scoped-DNS
+scenarios still require the privileged lane above. Record the tested commit,
+platform, binary digest, commands, skips and host restoration for each run;
+nonprivileged success alone does not certify native or AWS acceptance.
+
+## SSM termination acknowledgements
+
+Transport cleanup validates that a successful `TerminateSession` response names
+the exact owned session. Missing or mismatched responses retain ownership and do
+not produce a completion receipt. An invalid-session response requires an exact
+owned `Terminated` history record. Local transport shutdown and an acknowledged
+termination do not assert that AWS history immediately displays `Terminated`.
+
+Run the local response and ownership regressions with
+`uv run pytest tests/tunnel/test_transport.py -q`. Live AWS acceptance is a
+separate opt-in check; unit results do not certify it.
+
+## Shared-session subnet routing and conflicts
+
+Run the session boundary regressions without changing host networking:
+
+```bash
+uv run pytest tests/tunnel/test_forwarding.py tests/tunnel/test_supervisor.py \
+  tests/tunnel/test_dev_session.py tests/tunnel/test_runtime.py -q
+```
+
+They require the same private and isolated destination ranges in helper requests
+and forwarder controls. Reconnects, member refresh, and lost-reply replay keep the
+selection and DNS port stable. Empty or changed selections fail before SSH, with
+no whole-VPC fallback. Full VPC ownership overlap checks remain independent of
+this smaller route set.
+
+Readiness checks the resolver through SOCKS, each named resource through SOCKS
+and ordinary host TCP, and system-resolver delivery using a generation-bound
+observation. A successful SOCKS connection does not mask a failed direct resource
+path. The resolver-only direct probe is intentionally absent: the owning VPC
+resolver uses a separate SOCKS path.
+
+Conflict tests carry decoded range and interface facts from the worker through
+the bounded runtime status to the command. They reject untrusted exception text,
+invalid status causes, nonprintable text, and misplaced or oversized diagnostics.
+A conflict blocks dependent invocations but leaves other healthy VPCs and plain
+handlers usable. Cleanup failure retains the diagnostic and ownership evidence.
+Invalid-detail tests use a fixed session identifier containing `123` and check only
+the reports after the invalid status. Startup identifiers must not count as leaked
+diagnostics. The tests require a generic failure report and blocked VPC admission.
+These tests use isolated adapters, not actual LAN or VPN mutations. Native route
+conflict and host-baseline acceptance require the privileged tier in the final
+stack; unit success does not certify that acceptance.
+
+
+## Standalone subnet routing and diagnostics
+
+```bash
+uv run pytest tests/tunnel/test_standalone.py \
+  tests/integration/test_tunnel_audit.py -q
+```
+
+These nonprivileged tests drive the real CLI capture and shared-session status
+path with a controlled runtime boundary. They check two-VPC private/isolated
+selection, complete ownership CIDRs, exclusion of unused components, state-context
+release before startup, bounded conflict diagnostics, nonzero exit, and cleanup.
+They do not substitute for the worker's host-routing tests or native acceptance.
+
+The opt-in standalone AWS test also calls `assert_selected_routes()` after initial
+readiness, transport recovery, and a fresh command start. It reads actual macOS
+route lookups and requires exact private/isolated prefixes on separate per-VPC
+utun interfaces. Public subnets, the primary resolver, and unused VPC space must
+not use those interfaces. Each lookup is retained in
+`standalone-routes.jsonl` inside the temporary proof project. Deterministic tests
+reject whole-VPC routes, missing interfaces, cross-VPC interface reuse, and leaks
+into each excluded address category. Live execution requires both privileged
+and AWS opt-ins above; collection alone is not acceptance.
+
+
+## Proof application setup and partial deployments
+
+The standalone acceptance app uses one replica beyond the primary in its first
+DocumentDB cluster and no replicas in its second cluster. Nonprivileged tests
+execute the generated definition with real component constructors and controlled
+resource boundaries, so configuration API changes fail before AWS acceptance.
+
+Before destruction, acceptance discovers EC2 instances using the exact proof app
+and environment tags, validates ownership, and records attached volume IDs even
+when deployment outputs are incomplete. Successful empty discovery means no
+volumes need capture. Failed discovery or capture remains an acceptance failure;
+destruction and the absence audit still run. Proof host pins remain until all
+required cleanup checks pass. Deployment interruptions also run cleanup; simultaneous
+setup and cleanup failures are reported together.
+The absence audit checks DocumentDB cluster and instance application/environment
+ownership tags as well as readable name prefixes. This detects resources with
+compacted names even after a partial deployment. Tag inspection uses resource
+ARNs; missing ARNs or failed AWS requests fail the audit rather than certifying
+cleanup. Both ownership tags must match before an otherwise unrelated name is
+reported as belonging to the proof application.
+
+Dev acceptance captures exact Lambda log groups for its random proof app before
+destroy. After AWS confirms the proof Functions are gone, it deletes their exact
+default log-group names from the verified deployment outputs. This includes
+groups that Lambda creates during destroy, even when the earlier capture was
+empty. Missing
+groups are safe to delete. It then checks the proof app/environment prefix until
+all groups are absent.
+A pre-existing group under a newly selected proof name stops setup before deploy.
+The AWS test identity needs logs:DescribeLogGroups and logs:DeleteLogGroup. Cleanup
+never deletes a group for an untracked Function, even with the same app prefix.
+The independent audit remains read-only and reports any remaining group.
+`test_dev_destroy_removes_late_log_groups_for_verified_functions` covers both an
+empty capture and an existing group when another group appears during destroy.
+
+These checks do not certify a live acceptance run.
+
+
+## Dev-mode subnet routing and diagnostics
+
+```bash
+uv run pytest tests/tunnel/test_dev_session.py tests/test_cli_dev.py \
+  tests/bridge/test_dev_admission.py -q
+```
+
+The combined boundary regression runs dev command capture, the actual shared
+session and admission code, and actual bridge message dispatch with controlled
+runtime and publish adapters. It verifies two-VPC subnet selection, preservation
+of full ownership CIDRs, console conflict diagnostics, and cleanup. A conflicted
+VPC is rejected before handler lookup while a healthy VPC and a plain handler
+still dispatch. Malformed diagnostics block managed dependencies and are not
+printed. Public invocation errors must not contain local route diagnostics.
+These tests do not start an AppSync connection or mutate host networking.
+
+The opt-in dev AWS scenarios reuse `assert_selected_routes()` after readiness,
+transport recovery, process restart, and recovery from a host-key failure. They
+retain the exact-route and excluded-address evidence described above, alongside
+Function URL, DocumentDB TLS/member discovery/read-write, admission, and baseline
+restoration checks. Collection alone does not certify live acceptance. Run the
+privileged/AWS lane only with the required authorization and exclusive host
+ownership. Native Intel acceptance remains pending until run on Intel hardware.
+
+
+## Automated dev startup
+
+AWS dev acceptance uses `stlv dev ENV --yes` for its proof-owned shared
+environment. CLI subprocesses receive closed stdin, so an unexpected interactive
+prompt fails instead of waiting for input. Production shared-environment
+confirmation remains enabled when `--yes` is omitted. Deterministic tests check
+the subprocess arguments, captured local-binary selection, and real CLI
+confirmation behavior before the opt-in AWS run. Standalone acceptance still uses
+`stlv tunnel start ENV` without deployment confirmation flags.
+
+## Deployment state baselines
+
+Standalone acceptance captures the deployed checkpoint before `stlv tunnel start`.
+Startup and shutdown must leave those exact bytes unchanged because the command
+does not deploy.
+
+Each `stlv dev` startup deploys fresh endpoint IDs. The acceptance fixture discards
+the previous baseline when it starts a dev command and captures a new one after
+both networking and the invocation bridge are ready. It compares exact checkpoint
+bytes from that point through shutdown. Later readiness checks do not refresh the
+baseline, and failed startup cannot reuse an earlier command's checkpoint.
+
+The reconnect/SIGKILL and host-key restart scenarios both use this lifecycle. Do
+not compare raw checkpoints across separate dev deployments or normalize away
+changes during a running session. Mocked regressions in
+`tests/integration/test_tunnel_audit.py` check baseline capture, restart, startup
+failure, and unexpected state changes without AWS or host mutations.
+
+## SSM cleanup and history finalization
+
+Each shutdown check requires matching production start, observed-session, and
+completion receipts. It reads only those exact private files and retains the
+original receipts. Missing or unsafe evidence fails acceptance. A completion
+receipt establishes the production cleanup acknowledgement; separate helper,
+host-baseline, and local-process checks remain hard gates.
+
+The audit paginates active-session inventory and requires three consecutive
+observations without the captured sessions, one second apart, within its
+60-second observation budget. It also verifies exact session, target, and reason
+in history. `Terminated` finalizes history. An inactive, acknowledged session
+with an owned `Terminating` history record and a valid end time may pass
+functional cleanup with a visible delayed-finalization diagnostic. Other history
+states, mismatched ownership, API failures, or active sessions still fail.
+
+Every check saves a unique private `ssm-cleanup-*.json` file in the generated
+proof project, including observations, completion receipts, and the separate
+functional-cleanup and history-finalization results. No credentials or session
+tokens are recorded. Failed audits retain their evidence too.
+
+Run the mocked regressions without AWS or host changes:
+
+```bash
+uv run pytest tests/integration/test_ssm_cleanup.py tests/integration/test_tunnel_audit.py -n 0
+```
+
+These local tests do not certify live acceptance. Record privileged and AWS
+results for each new candidate; previous failed runs retain their original result.
+
+
+### Worker-status checks in CLI acceptance
+
+Rich can wrap a worker-status message between fields in captured CLI output.
+The acceptance fixture reads one complete record across at most four lines and
+4096 characters. It requires the requested VPC identity, state, numeric attempt,
+exact cause, and DNS-retention flag in that record. A cause from another VPC or
+an unrelated message cannot satisfy the check. Incomplete records remain pending
+until more output arrives; command exit and timeout still fail the check.
+
+`tests/integration/test_tunnel_audit.py` covers unwrapped and wrapped records,
+partial output, neighboring VPCs, invalid fields, bounds, and command exit. The
+privileged AWS host-key scenario verifies the full rejection and restart path.
+
+
+## Shared diagnostics and local reports
+
+`stlv tunnel diagnose` and `stlv tunnel diagnose --json` use the same versioned
+report. The command runs outside a project and never starts networking, installs
+artifacts, requests elevation, calls AWS, or changes routes or DNS. Uploads and
+the monitor UI are not included.
+
+Report schema 2 parses macOS observations before JSON or table rendering. Pure
+parser fixtures cover interface aliases, IPv6 scope, point-to-point peers, bridge
+members, variable route columns, scoped DNS, disabled services, empty DNS settings,
+proxy privacy, launchd nesting, and denied packet-filter access. Tests retain valid
+records after malformed or truncated input, check nested lookups for raw-output
+leaks, and render more than 50 records on narrow and wide terminals without row
+limits or Python dictionary representations. IPC versions remain unchanged.
+
+The runtime publishes a same-UID snapshot endpoint under
+`/private/tmp/stlv-diag-<uid>/`. Its four diagnostic clients share one on-demand
+sample per source per second. The helper has a new read-only operation; the
+forwarder uses an inherited socket separate from mutation control. The runtime
+records up to 256 transition events. Client failure does not own the tunnel lease.
+
+Run Python diagnostics, control compatibility, and protocol tests with:
+
+```bash
+uv run pytest tests/tunnel/test_diagnostics.py tests/tunnel/test_diagnostics_parsers.py \
+  tests/tunnel/test_forwarding.py \
+  tests/tunnel/test_helper_client.py tests/tunnel/test_helper_protocol.py \
+  tests/tunnel/test_protocol_vectors.py tests/tunnel/test_supervisor.py -q
+```
+
+Run the Go module's `make test race vet lint` checks. The diagnostics parser also
+has `FuzzDecode`; run it with a bounded fuzz duration. Python tests do not compile
+Go. Build matching developer images with the existing `scripts/build.py
+--build-only` workflow before interoperability or native tests.
+
+The explicit serial native test installs the selected image and restores the
+original helper and independently checked host baseline. It uses two local SOCKS
+fixtures and needs no AWS credentials or deployment:
+
+```bash
+STLV_TRAFORO_DEV_BINARY=/absolute/path/to/validated/traforo-darwin-arm64 \
+uv run pytest tests/integration/test_tunnel_diagnostics.py \
+  --integration-macos-privileged -n 0 -q
+```
+
+It checks live packet/TCP counters, DNS and resolver observations, repeated
+snapshots, a separate CLI reader, partial forwarder-source failure, unchanged
+ownership, and continued forwarding after diagnostics fails. Record the candidate
+commit, platform, artifact digest, commands, skips, and restoration evidence.
+
+The pinned v0.0.7 image does not support statistics. A compatible image reports its
+capability in the existing ready handshake. Old images continue forwarding; the
+report marks missing diagnostics unavailable and uses legacy helper status where
+possible. Publishing and pinning a new release is a separate step.
+
+## AWS networking acceptance with private Lambda APIs
+
+Use the Lambda suite for AWS networking acceptance without waiting for DocumentDB
+clusters. It covers two independent VPCs, private HTTPS and DNS, partial failure,
+reconnection, invocation admission, and host-key rejection. Add the existing
+non-VPC test to complete the AWS networking command below. Keep Go unit/race and
+native host/installation tests as separate gates. Run DocumentDB acceptance when
+checking the production resource-discovery/readiness path, exact endpoint/member
+DNS ownership, database TLS, replica members, authentication, and read/write
+behavior; the Lambda suite does not replace these service-specific checks.
+
+```bash
+# Build locally; this command does not install the helper.
+GOTOOLCHAIN=go1.27.3 uv run python pkg/traforo-client-go/scripts/build.py --build-only
+# Use the exact export printed by the builder in this shell.
+export STLV_TRAFORO_DEV_BINARY=/absolute/path/printed/by/the/builder
+
+export STLV_TEST_AWS_PROFILE=default
+export STLV_TEST_AWS_REGION=us-east-1
+export STLV_TEST_TUNNEL_AWS_ACCOUNT=<verified-account-id>
+uv run pytest tests/integration/test_tunnel_lambda.py \
+  tests/integration/test_tunnel.py::test_non_vpc_actual_dev_runs_without_installed_helper \
+  --integration-macos-privileged --integration-tunnel -n 0 -vv
+```
+
+Use an ordinary-user macOS 15+ host with no live tunnel or uncertain helper state.
+Authorize helper administration when macOS requests it. The exclusive-host fixture
+preserves the original installation, installs the selected image, and restores the
+helper and independently checked network baseline afterward. The private Session
+Manager plugin must pass the normal version checks. No Traforo release download
+is needed with the developer override. `run_all.sh` never runs this suite.
+
+Seven Lambda tests share one disposable application. Two managed VPCs each have
+their own bastion, private API Gateway REST API, IPv4 interface endpoint, Lambda backend,
+and VPC-attached client Function. A third VPC has `bastion=False` and a plain
+client Function; a fourth client Function has no VPC attachment. The plain clients
+perform no private API request. All four clients use local invocation evidence to
+prove that the bridge ran the handler on the laptop. The backends have no VPC
+attachment or public URL. Each endpoint admits HTTPS from only its owning bastion security group, and
+each API policy restricts requests to its own endpoint. The API-ID hostname is a
+configured DNS domain for that VPC. Backend identity includes the VPC number.
+
+Standalone requests follow host DNS and utun through Traforo, SSH and Session
+Manager to the private endpoint. The dev tests invoke each client's public Function
+URL, then prove that its local handler called the correct private API. The public
+URL alone is not evidence of a tunnel. Requests use normal HTTPS hostname and
+certificate checks, fresh connections, and no environment HTTP proxy.
+
+Assertions check simultaneous requests, exact endpoint private addresses, distinct
+subnet routes/interfaces, distinct DNS listener ports, nonces, and payload digests.
+Each DNS listener must refuse the other VPC's hostname with `REFUSED`. Both private
+APIs must be unreachable without their tunnels. The APIs are custom-domain
+targets, so the tests explicitly probe them after CLI readiness. Initial target
+connection failures have a 90-second readiness budget; a wrong backend identity
+or payload fails immediately.
+
+The standalone fault test stops the first proof-owned bastion. The dev fault test
+stops the second, reversing the healthy and failed roles. Both require:
+
+- The failed unit retains its DNS listener and returns `SERVFAIL` for its own name.
+- Fresh HTTPS requests through the healthy peer still return its own backend data.
+- The healthy unit's generation and SSM session stay unchanged.
+- The dev bridge rejects failed-VPC invocations with `VpcUnavailableError` before
+  handler import or entry, while healthy-VPC invocations keep working.
+- The disabled-bastion and non-VPC clients keep returning fresh nonces from local
+  handlers in the same dev process. The disabled VPC emits exactly one startup
+  warning and never acquires a managed network unit.
+- Restart restores access with a fresh failed-unit generation, the same DNS ports,
+  unchanged SSH pins, and no replacement application infrastructure.
+
+Fault cleanup restarts only the verified proof bastion, including after an assertion
+fails. A separate test changes a proof bastion's host key, checks rejection and
+peer availability, confirms a new runtime cannot replace the pin, restores the
+original key, and requires a fresh session for recovery. Both unrelated plain
+clients must keep working during the host-key failure, including in a new dev
+runtime. A separate standalone test makes two startup attempts with the changed
+key. Each must exit with status 1, name the instance and trust-reset command, and
+never print `Network READY`. It checks unchanged pins and deployment state,
+empty helper state, no resolver files, and no active owned SSM sessions. After
+restoring the key, a fresh command must connect successfully. These tests use the
+existing bounded SSM fault fixture and never reset trust to accept the changed key.
+
+A separate dev lifecycle test invokes both private APIs and both plain clients,
+kills the actual `stlv dev` command with SIGKILL, and certifies host and transport
+cleanup. It starts dev again, invokes all four clients, verifies unchanged SSH
+pins, and checks graceful shutdown. The standalone SIGKILL test remains separate.
+
+The suite also checks ordinary transport termination, SIGINT, terminated owned
+SSM sessions, unchanged standalone deployment state, and retained deployment-
+owned bastions. Dev Ctrl+C can return Click's abort status (1), while standalone
+Ctrl+C must return 0. Both must meet the shutdown limit and certify cleanup.
+
+The AWS identity needs ordinary tunnel deployment permissions, plus API Gateway
+REST API administration, VPC interface endpoints, Lambda integration permissions,
+log/IAM administration, proof-owned EC2 stop/start, and SSM Run Command for the key
+fault. The account is checked before resource creation. The fixture saves each
+exact API ID before application deployment, verifies ownership before deletion,
+and audits API and endpoint absence independently. One missing endpoint must not
+hide a surviving peer. Quota-limited API create, deploy, and delete calls retry explicit throttle
+responses with bounded backoff; unknown mutation outcomes are not retried. See the
+[AWS management quotas](https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html).
+
+Costs include two running bastions, two interface endpoints, API calls, Lambda,
+and logs until teardown finishes. The suite removes DocumentDB delays; VPC-attached
+client Functions can still delay Lambda interface cleanup. Both bastions remain
+after normal tunnel exit and are removed only by application teardown.
+
+Keep the pytest temporary directory after failures. It contains each
+`private-api-<number>.json`, `lambda-acceptance.json` (API IDs, endpoint IDs, volume
+IDs, and deployment/exercise/teardown durations), per-test CLI logs, SSM cleanup
+receipts, and host baseline/restoration evidence. Cleanup or audit failures fail
+acceptance. Record each run's commit, platform, binary digest, plugin version,
+results, durations, skips, and certified cleanup. Do not infer a pass from
+collection or a prior candidate. Generated state can contain secrets; keep full
+evidence private.
+
+The fixture's non-AWS checks run with:
+
+```bash
+uv run pytest tests/tunnel/test_lambda_acceptance_fixture.py -q
+```

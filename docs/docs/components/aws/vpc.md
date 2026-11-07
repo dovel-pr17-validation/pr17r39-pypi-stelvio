@@ -1,0 +1,408 @@
+# Working with VPC in Stelvio
+
+Stelvio supports creating [Amazon VPC (Virtual Private Cloud)](https://aws.amazon.com/vpc/) networks using the `Vpc` component. You need a VPC when you work with resources that live inside a private network — databases, or Lambda functions that access them.
+
+By default, the `Vpc` component creates a VPC spanning two AZs (availability zones) with three subnets in each — public, private and isolated — plus an Internet Gateway and a route table per subnet, following best practices. Optionally it creates [NAT](#nat) so resources in private subnets can reach the internet.
+
+!!! warning "NAT costs money"
+    A VPC itself is free, but NAT is not — the default two-AZ setup with `nat="managed"` costs about $73/month plus data charges. See [Cost](#cost) before enabling NAT.
+
+## Creating VPC
+
+Here's how to create a VPC with default settings:
+
+```python
+from stelvio.aws.vpc import Vpc
+
+vpc = Vpc("main")
+```
+
+This creates a VPC with two AZs and three subnets in each.
+
+## AZs - Availability Zones
+
+If you need more (or fewer) AZs, use the `az` parameter — it takes a number.
+Stelvio picks the first N available AZs in your region:
+
+```python
+from stelvio.aws.vpc import Vpc
+
+vpc = Vpc("main", az=3)
+```
+
+`az` also accepts a list of AZ names if you want to be specific: `az=["us-east-1b", "us-east-1c"]`.
+
+Each AWS region has a different number of AZs. Stelvio validates `az` during
+deployment — asking for more AZs than the region has, or for an AZ name that
+doesn't exist there, raises an error. Local Zones and Wavelength Zones are not
+supported.
+
+### Changing AZs later
+
+You can change `az` on a deployed VPC: add, remove, reorder or swap AZs. Each
+subnet belongs to its AZ, so the subnets of the AZs you keep stay as they are.
+Removing an AZ deletes its subnets, and AWS won't delete a subnet that still has
+something in it, for example a database. With NAT, some settings follow the
+order of the list, see [NAT](#nat).
+
+## Subnets and Network Layout
+
+Each AZ gets one subnet of each type:
+
+- **Public** — has a route to the Internet Gateway. For resources that must be reachable from the internet. This is also where NAT lives.
+- **Private** — not reachable from the internet; outbound access only through [NAT](#nat). This is where your workloads — like Lambda functions — go.
+- **Isolated** — no internet route at all. Ideal for databases.
+
+The VPC uses the `10.0.0.0/16` network and carves subnet ranges from it automatically:
+
+| Subnet   | Size | CIDR ranges (per AZ)              | Internet route       |
+|----------|------|-----------------------------------|----------------------|
+| Public   | /24  | `10.0.0.0/24`, `10.0.1.0/24`, …   | via Internet Gateway |
+| Private  | /22  | `10.0.20.0/22`, `10.0.24.0/22`, … | via NAT (if enabled) |
+| Isolated | /24  | `10.0.60.0/24`, `10.0.61.0/24`, … | none                 |
+
+An AZ's ranges follow the last letter of its name: `a` gets the first range of
+each type, `b` the second, and so on. In a region without `b` (ap-northeast-1
+has `a`, `c` and `d`), the second ranges stay unused.
+
+Private subnets are bigger (/22, ~1,000 IPs each) because that's where most of
+your resources — and their network interfaces — end up.
+
+Every subnet gets its own route table, and the VPC has DNS support and DNS
+hostnames enabled.
+
+## NAT
+
+NAT allows resources in your private subnets to access the internet. Without NAT,
+private and isolated subnets are the same — they can't access anything outside of
+the VPC. By default, NAT is not enabled because it [incurs cost](#cost).
+
+Stelvio currently supports managed NAT — NAT Gateways managed by AWS that
+autoscale with your needs. It isn't cheap, though; [see Cost section below](#cost).
+
+```python
+from stelvio.aws.vpc import Vpc
+
+vpc = Vpc("main", nat="managed")
+```
+
+This will create one NAT in each AZ. That's generally good practice for production
+in case one AZ goes down, but for non-production environments one shared NAT is
+enough. To use only one NAT per VPC use `NatConfig`:
+
+```python
+from stelvio.aws.vpc import Vpc, NatConfig
+
+vpc = Vpc("main", nat=NatConfig(type="managed", single=True))
+```
+
+You can also pass a plain dict: `nat={"type": "managed", "single": True}`.
+
+The single NAT lives in the first AZ of `az`. If you put a different AZ first,
+Stelvio replaces the NAT. If Stelvio created its Elastic IP, the public IP
+changes.
+
+!!! note "Planned: ec2 NAT"
+    A much cheaper NAT option — a small EC2 instance running
+    [fck-nat](https://fck-nat.dev) managed by Stelvio — is planned.
+    `NatConfig` only accepts `type="managed"` for now.
+
+<!-- Future (ec2 NAT, PR5) — original text, restore/adapt when it ships:
+
+Stelvio gives you two options for NAT: managed and ec2.
+
+Managed NAT, as name suggests, is managed by AWS, it autoscales with your needs
+but it isn't cheap. ec2 NAT is small ec2 instance managed by Stelvio that is much
+cheaper. [See Cost section below](#cost).
+
+`NatConfig` ec2 options:
+
+- `ami` - AMI to use for ec2 NAT; default is `fck-nat`.
+- `instance` - which ec2 instance type to use; default is `t4g.nano`
+- `role` - IAM role if you want to reuse some; by default new role is created
+-->
+
+### Using your own Elastic IPs
+
+By default, Stelvio creates an Elastic IP for each NAT gateway. If you want to
+keep your outbound IPs stable — for example because a third party whitelists
+them — pass allocation IDs of your existing Elastic IPs via `ip`:
+
+```python
+vpc = Vpc(
+    "main",
+    nat=NatConfig(type="managed", ip=["eipalloc-0a1b2c3d", "eipalloc-4e5f6a7b"]),
+)
+```
+
+You must provide exactly one allocation ID per NAT gateway: one per AZ, or a
+single one with `single=True`. Stelvio then creates no Elastic IPs of its own —
+the adopted IPs remain yours and are not released when the VPC is destroyed.
+
+The IDs pair with AZs by position: the first ID goes to the NAT in the first AZ
+of `az`, and so on. If you reorder `az`, reorder `ip` the same way. A change of
+`az` that gives one of your IDs to a NAT in a different AZ isn't supported.
+
+## Security Groups
+
+Stelvio creates one app security group per VPC the first time something reads it:
+a Function joining the VPC, or a datastore such as DocumentDB opening its port to
+the group. Every attached function shares that group: no inbound rules, all
+outbound traffic allowed. Datastore components open their port to this group, so
+functions reach them with no security group work on your side. Functions that
+need different rules bring their own groups, see
+[Lambda Functions in VPC](#lambda-functions-in-vpc).
+
+Stelvio also empties the VPC's default security group. Nothing Stelvio creates
+uses it, and an unused group with allow-all rules is a common audit finding
+(CIS benchmark 5.4).
+
+## Lambda Functions in VPC
+
+Pass a `Vpc` to a `Function` to run it inside the network:
+
+```python
+from stelvio.aws.function import Function
+from stelvio.aws.vpc import Vpc
+
+vpc = Vpc("main", nat="managed")
+
+Function("worker", handler="functions/worker.handler", vpc=vpc)
+```
+
+The function gets network interfaces in the private subnet of every AZ and uses
+the VPC's [app security group](#security-groups).
+Anything that builds a `Function` for you takes the same `vpc` value in its
+handler config: API routes and authorizers, `Cron`, subscriptions on queues,
+topics, buckets and tables, Cognito triggers and AppSync data sources.
+
+To choose the subnet tier or bring your own security groups, use
+`VpcAttachment` or a dict:
+
+```python
+from stelvio.aws.function import Function
+from stelvio.aws.vpc import Vpc, VpcAttachment
+
+vpc = Vpc("main")
+
+# Isolated subnets: reachable only from inside the VPC
+Function(
+    "indexer",
+    handler="functions/indexer.handler",
+    vpc=VpcAttachment(vpc=vpc, subnets="isolated"),
+)
+
+# Your own security groups instead of the app security group
+Function(
+    "legacy",
+    handler="functions/legacy.handler",
+    vpc={"vpc": vpc, "security_groups": ["sg-0123456789abcdef0"]},
+)
+```
+
+| Option            | Default            | Description                                                          |
+|-------------------|--------------------|----------------------------------------------------------------------|
+| `vpc`             |                    | The `Vpc` to join                                                    |
+| `subnets`         | `"private"`        | `"private"` (internet via NAT) or `"isolated"` (in-VPC only)         |
+| `security_groups` | app security group | Existing security group IDs to use instead, up to 5. You manage their rules |
+
+Public subnets are not an option: Lambda network interfaces never get a public
+IP, so a public subnet would leave the function with no route out.
+
+!!! warning "No NAT, no AWS APIs"
+    A function inside a VPC has no internet access of its own. In a private
+    subnet it goes out through the VPC's [NAT](#nat). Without NAT, or in an
+    isolated subnet, it reaches only the VPC. That includes AWS services: calls
+    to DynamoDB, S3, SQS and the rest hang until they time out. Enable NAT if
+    the function needs anything outside the VPC. VPC endpoints are coming later.
+
+**Deploys and dev mode.** The first function in a VPC takes a few minutes to
+deploy while AWS creates its network interfaces. Later functions on the same
+VPC reuse them. Adding or removing `vpc` on an existing function is an in-place
+update. Destroying a VPC waits for Lambda to release the interfaces, which can
+take several minutes. `stlv dev` runs your handlers on your machine, outside
+the VPC, so resources reachable only from inside the VPC are not available in
+dev mode yet. Dev mode access to VPC resources is coming soon.
+
+## Linking resources in VPC
+
+A datastore in the VPC opens its port to the [app security group](#security-groups)
+when you create it. Linking a Function injects connection details and IAM; it does
+not add a network grant. So a Function that links a datastore must join the same
+Vpc with `vpc=`, or Stelvio raises `ValueError` when you create the Function. See
+[Linking a DocumentDB cluster](document-db.md#linking) for an example.
+
+## Bastion resources
+
+`bastion` controls whether deployment creates persistent access resources for
+this VPC. It does not change production Lambda VPC attachment. Bastion access
+is disabled by default.
+
+```python
+from stelvio.aws.vpc import BastionConfig, Vpc
+
+Vpc("main", bastion=True)
+Vpc("private", bastion=BastionConfig(dns_domains=("internal.example.com",)))
+```
+
+Omitting `bastion` or setting it to `False` creates no bastion. `True`, an empty
+dict, `BastionConfig()`, or a dict with `dns_domains` enables one. Explicit
+`None` and unknown dict keys are invalid. Domain names are normalized and
+validated. They describe private DNS suffixes; Stelvio does not create a DNS
+zone or change VPC DNS settings.
+
+When enabled, normal deployment creates a persistent EC2 instance, an IAM role
+and instance profile, and a security group. The instance runs
+in a public subnet for outbound AWS connectivity. Its security group has no
+inbound rules by default, and its SSH server listens on loopback. The instance and public
+IPv4 address have ongoing AWS costs while deployed. Destroy the VPC or disable
+`bastion` and deploy to remove these resources.
+
+The access resources are separate from Lambda production networking. A
+`Function(vpc=vpc)` still uses the VPC's private subnets and app security group.
+Dev mode access to VPC resources is not available yet.
+
+The private deployment metadata records each subnet's ID, availability zone,
+and CIDR in a public, private, or isolated tier. Private and isolated subnet
+CIDRs define eligible tunnel destinations. Public subnets describe bastion
+placement; they are excluded from that destination list. The VPC CIDRs remain
+the boundary for AWS ownership validation. These outputs prepare the tunnel
+contract; this deployment step does not install local routes.
+
+## Cost
+
+The VPC itself — subnets, route tables, Internet Gateway — is free. NAT is what
+costs money:
+
+- A managed NAT Gateway costs **~$33/month** ($0.045/hour, always on) plus
+  **$0.045 per GB** of data processed.
+- Its Elastic IP adds **~$3.65/month** — since February 2024 AWS charges
+  $0.005/hour for every public IPv4 address, in use or not.
+- The default two-AZ setup with `nat="managed"` therefore runs **~$73/month**
+  before data charges.
+- `NatConfig(type="managed", single=True)` cuts that to one NAT — **~$37/month**.
+  Good enough for dev, staging, and many small production apps.
+
+Prices are for `us-east-1`; check [AWS VPC pricing](https://aws.amazon.com/vpc/pricing/)
+for your region.
+
+<!-- Future (ec2 NAT, PR5) — cost comparison, restore when it ships:
+
+ec2 with t4g.nano is ~$3/mo per NAT + $0.09/GB.
+With 2 AZs it's $64 per month + data for managed and $6 per month + data for ec2.
+-->
+
+## Customization
+
+The `Vpc` component supports the `customize` parameter to override underlying
+Pulumi resource properties. For an overview of how customization works, see the
+[Customization guide](../../concepts/customization.md).
+
+### Resource Keys
+
+| Resource Key            | Pulumi Args Type                                                                                                    | Description                     |
+|-------------------------|---------------------------------------------------------------------------------------------------------------------|---------------------------------|
+| `vpc`                   | [VpcArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/vpc/#inputs)                                    | The VPC                         |
+| `internet_gateway`      | [InternetGatewayArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/internetgateway/#inputs)            | The Internet Gateway            |
+| `public_subnet`         | [SubnetArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/subnet/#inputs)                              | Public subnets (all AZs)        |
+| `private_subnet`        | [SubnetArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/subnet/#inputs)                              | Private subnets (all AZs)       |
+| `isolated_subnet`       | [SubnetArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/subnet/#inputs)                              | Isolated subnets (all AZs)      |
+| `public_route_table`    | [RouteTableArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/routetable/#inputs)                      | Public route tables (all AZs)   |
+| `private_route_table`   | [RouteTableArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/routetable/#inputs)                      | Private route tables (all AZs)  |
+| `isolated_route_table`  | [RouteTableArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/routetable/#inputs)                      | Isolated route tables (all AZs) |
+| `elastic_ip`            | [EipArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/eip/#inputs)                                    | NAT Elastic IPs                 |
+| `nat_gateway`           | [NatGatewayArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/natgateway/#inputs)                      | NAT Gateways                    |
+| `bastion`               | [InstanceArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/instance/#inputs)                           | Persistent access instance      |
+| `bastion_security_group` | [SecurityGroupArgs](https://www.pulumi.com/registry/packages/aws/api-docs/ec2/securitygroup/#inputs)                 | Bastion security group           |
+| `bastion_role`          | [RoleArgs](https://www.pulumi.com/registry/packages/aws/api-docs/iam/role/#inputs)                                   | Bastion IAM role                 |
+| `bastion_profile`       | [InstanceProfileArgs](https://www.pulumi.com/registry/packages/aws/api-docs/iam/instanceprofile/#inputs)             | Bastion IAM instance profile     |
+
+### Example
+
+```python
+vpc = Vpc(
+    "main",
+    customize={
+        "public_subnet": {"map_public_ip_on_launch": True},
+    }
+)
+```
+
+!!! warning "Subnet and route table keys apply to all subnets of that type"
+    There is one subnet (and route table) of each type *per AZ*, but only one
+    customize key per type — a dict value is applied to every subnet of that
+    type identically. Overriding per-subnet values like `cidr_block` this way
+    breaks deployment, because every subnet of that type would get the same value.
+    Use a callable instead — it's called for each subnet with that subnet's
+    computed properties, so you can adjust values per subnet. For example, to
+    move public subnets from `10.0.0.x` to `10.0.100.x` (each subnet's own CIDR
+    shifted, staying within the VPC's `10.0.0.0/16`):
+
+    ```python
+    def shift_public_cidr(props):
+        octets = props["cidr_block"].split(".")  # 10.0.0.0/24, 10.0.1.0/24, ...
+        octets[2] = str(int(octets[2]) + 100)    # 10.0.100.0/24, 10.0.101.0/24, ...
+        return {**props, "cidr_block": ".".join(octets)}
+
+    vpc = Vpc("main", customize={"public_subnet": shift_public_cidr})
+    ```
+
+!!! warning "Changing the VPC CIDR"
+    Stelvio supports only the default `10.0.0.0/16` and always places subnets
+    in `10.0.x.x`. If you change the VPC's `cidr_block`, change the `cidr_block`
+    of every subnet type with it, or the subnets fall outside the VPC and the
+    deploy fails. Choose the range when you create the VPC: a different
+    `cidr_block` later means a new VPC.
+
+    ```python
+    def to_10_1(props):
+        return {**props, "cidr_block": props["cidr_block"].replace("10.0.", "10.1.", 1)}
+
+    vpc = Vpc(
+        "main",
+        customize={
+            "vpc": {"cidr_block": "10.1.0.0/16"},
+            "public_subnet": to_10_1,
+            "private_subnet": to_10_1,
+            "isolated_subnet": to_10_1,
+        },
+    )
+    ```
+
+## Coming Soon
+
+VPC support in Stelvio will grow in upcoming releases:
+
+- **Dev mode access** — reach resources inside your VPC from your local machine
+  during `stlv dev`.
+- **ec2 NAT** — much cheaper NAT using [fck-nat](https://fck-nat.dev) instances.
+
+<!-- Future sections: drafts for upcoming PRs (dev-mode bastion). Uncomment/adapt as they ship.
+
+## Dev mode
+
+IMPLEMENTATION INFO:
+For dev mode we'll also need to have `bastion` parameter to VPC. It will create
+small ec2 instance in VPC (or reuse NAT instance if it's ec2) which then we can
+connect to from local computer when in `stlv dev`.
+Stubs won't need to be in VPC, since those are just stubs and need to connect to AppSync. Bastion is needed for dev machine to reach VPC resources, not functions.
+
+```python
+from stelvio.aws.vpc import Vpc
+from stelvio.aws.function import Function
+from stelvio.aws.document_db import DocumentDb
+
+vpc = Vpc("main", nat="managed", bastion=True)
+
+db = DocumentDb("todos", vpc=vpc)
+
+Function("api", handler="functions/todos.handler", vpc=vpc, links=[db])
+```
+
+-->
+
+## Next Steps
+
+- [DocumentDB](document-db.md): Clusters in isolated subnets, admitted by the app security group
+- [Customization](../../concepts/customization.md) — Override any Pulumi resource property
+- [Tags](../../concepts/tags.md) — Tag your VPC resources

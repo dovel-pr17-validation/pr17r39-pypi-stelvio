@@ -1,0 +1,478 @@
+# Changelog
+
+## 0.11.0b8 (2026-MM-DD)
+
+### DocumentDB
+
+- **New `DocumentDb` component.** Creates a private, TLS-required, encrypted cluster in a Vpc's isolated subnets with an AWS-managed master password. Serverless is the default (0.5–4 DCUs per instance); use `instance` for a provisioned class, `replicas` for read replicas, and `min_capacity`/`max_capacity` for capacity bounds. `secret_rotation` is days (default `7`) or `False` to disable AWS-managed password rotation. Linked Functions must join the same Vpc; linking injects connection properties and IAM, not a network path. The CA bundle is packaged into linked Functions on deploy; in `stlv dev`, `ca_file` and the URI use the absolute cache path.
+
+    → [DocumentDB Guide](components/aws/document-db.md)
+
+### Dev Mode
+
+- **Tunnel diagnostics collect local support information.** Use `stlv tunnel diagnose` for complete tables of parsed observations or add `--json` for structured report schema version 2. System command text is not included in either format. The shared read-only interface provides session state and packet, TCP, and DNS statistics when a compatible Traforo image is installed. The command does not change networking or contact AWS.
+
+- **`stlv dev` starts managed networking for private handler dependencies.** It captures deployed VPC metadata, starts the shared session before the AppSync bridge, and rejects expired or unready dependent invocations before handler import. A failure in one VPC does not block independent Functions. Managed routes cover the deployed private and isolated subnets. Route conflicts show both ranges in the local console and block dependent handlers without widening routes to the whole VPC.
+
+    → [Dev Mode Guide](concepts/dev-mode.md#managed-vpc-transport)
+
+### Bug Fixes
+
+- **`Ctrl+C` stops `stlv dev` even while a handler is running.** Before, it could hang for up to 5 minutes.
+- **`stlv dev` matches the deployed Lambda.** `context.function_name` and the `AWS_LAMBDA_*` env vars are set, and a request waits for the Function's `timeout` (up to 25 s), not 16 s.
+- **Router rejects route paths it routed wrong.** `/api/`, `api` or a `?` deployed but routed wrong. Use `/api`, `/api/*` or `/*`. A route that an earlier route always catches (`/api` next to `/api*`) is rejected too. A `*` mid-path (`/images/*.jpg`) now works for a Bucket too.
+- **Adding a Router route no longer touches the other routes' resources.** Before, a new `/static/*` could leave a bucket route at 403. Existing stacks: deploy once with routes unchanged first. If a route must change in that deploy, see [Upgrading](components/aws/cloudfront-router.md#upgrading-an-existing-router).
+
+### Breaking Changes
+
+- **Code to change:** `Bucket.notify_function` takes `links=` as a function option, like `Queue.subscribe`. With a `FunctionConfig` or dict handler it now raises instead of merging; put the links in the config: `function=FunctionConfig(handler=..., links=[table])`. To keep a `FunctionConfig` you already have, `function=replace(config, links=[*config.links, table])` with `from dataclasses import replace`. `links=None` raises too; leave it out.
+- **App and env names: letters, digits and single `-` only, the app name starting with a letter.** An app or env named otherwise no longer deploys, including a saved `.stelvio/userenv`. The name is the stack, so there is no rename: `stlv destroy` the old name (destroy still loads it), which deletes its data, then rename and deploy. The default env from your OS username is now lowercased and cleaned (`John.Doe` → `john-doe`); a saved `.stelvio/userenv` is used as is. For a personal env, destroy before you change `.stelvio/userenv`; on a fresh clone, put the old name in `.stelvio/userenv` first.
+- **`Router(routes=...)` is removed, and `price_class` and `custom_domain` are keyword-only.** `routes=` was never documented; add routes with `route()`.
+
+## 0.10.2b8 (2026-10-23)
+
+### Security fixes
+
+- **Update your tools following the eMudhra/emSign certificate compromise.** Upgrade your own uv to **0.13.5 or later** and pip to **26.2.2 or later**, following the [Python advisory's upgrade instructions](https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576). Stelvio requires `certifi>=2026.10.19` and `uv>=0.13.5`; upgrade pip separately.
+- **Update deployed Lambda dependencies.** Bump certifi to **2026.10.19 or later** in your Lambda requirements, rebuild affected packages or layers, and redeploy.
+- **New `stlv init` projects require uv 0.13.5 or later.** The base template enforces this minimum with `tool.uv.required-version`.
+
+### Bug Fixes
+
+- **AppSync Lambda authorizers use the correct function ARN.** Applies to primary and additional authentication.
+- **Router routes work on `/`, on `/api` without a slash, and for HttpApi.** On `/` an API took only GET and lost its query string, `/api` went to the root route, and HttpApi routes got 403. A Bucket on `/` now serves `index.html` and is cached for a day like other bucket routes: [invalidate](components/aws/cloudfront-router.md#s3-buckets-cache-behavior) after an upload.
+- **Router API and Function routes get the client's headers and cookies.** Every request lost `Accept`, `Referer` and cookies, and a GET lost `Authorization`. Function routes with IAM auth still see CloudFront's signature there. CloudFront no longer compresses their responses, and a `distribution` customize that adds `forwarded_values` to them now fails.
+
+## 0.10.1b7 (2026-10-09)
+
+### Lambda Functions in VPC
+
+- **Functions can join a `Vpc`.** `Function(vpc=vpc)` runs the function in the VPC's private subnets behind a shared app security group; `subnets="isolated"` and `security_groups=[...]` give control.
+
+    → [VPC Guide](components/aws/vpc.md#lambda-functions-in-vpc)
+
+### Lambda Functions
+
+- **`runtime` accepts `python3.10` to `python3.15`** on `Function` and `Layer`.
+
+### Resource Naming
+
+- **One naming rule.** New queues, topics, buckets, user pools, user pool clients and static website functions get Pulumi-generated names, `<app>-<env>-<name>-<random>`, so a replacement never collides with the one it replaces. Existing deployments keep their names.
+
+    → [Resource Naming](concepts/naming.md)
+
+### Other AWS Resources
+
+- **`pulumi_aws` resources in `@app.run` get Stelvio's tags.** `stelvio:app`, `stelvio:env` and your global tags now reach resources you create yourself. Existing ones get a tag update on the next deploy, no replacement.
+
+    → [Other AWS Resources](concepts/other-aws-resources.md)
+
+### CLI
+
+- **Clearer `stlv` output.** `stlv diff` labels and sorts child resources (`Subnet (public-a)`), and an AWS credential problem stops `stlv` with a short message and a fix instead of a traceback.
+
+    → [Troubleshooting](intro/troubleshooting.md#aws-credential-issues)
+
+### Dependencies
+
+- **Pulumi stack bumped.** SDK/CLI `3.263.0`, `pulumi-aws` `7.47.0`, `pulumi-cloudflare` `6.21.0`. Stelvio downloads the matching CLI on next run.
+- **Dropped `awslambdaric`.** `stlv dev` builds Lambda context with a built-in mock, so install no longer needs that package (no wheel on macOS/Windows).
+
+### Breaking Changes
+
+- **Code to change:** `RestApi.invoke_url`/`api_arn` are now `url`/`arn`. AppSync `domain=` is `domain_name=` (customize key `custom_domain`) and its link env var is `STLV_<NAME>_API_URL`. An API stage name goes in `stage_name=`, not `customize`. `HttpApiResources` drops `integrations`, `routes` and `permissions`. `Bucket` notification customize moves to each `notify_function(customize=...)` call. App-wide `customize` raises when the config loads on an unknown key, a non-dict value, or a key that configures a child component (`{Cron: {"function": ...}}`); set those per instance.
+- **Only this app and env's buckets and topics can send to a Stelvio queue or topic.** The policy Stelvio writes for `notify_queue`, `notify_topic` and `subscribe_queue` used to let in any bucket or topic in the account; now only names starting with `<app>-<env>-`. A sender outside that (another env's bucket, one wired up by hand) stops delivering, and a Stelvio bucket or topic renamed through `customize` without the prefix fails the deploy. To let them in, send to that queue or topic by ARN string from every sender (`bucket.notify_queue("x", queue.arn)`) and set its policy yourself (`Queue(customize={"queue": {"policy": ...}})`).
+- **`subscribe_queue` no longer takes a `queue_policy` customize key.** Every sender to a queue now writes the same shared policy, so one sender can't change it; set the policy on the `Queue` as above.
+- **Replaced on the next deploy:** FIFO topics, FIFO queues named `*.fifo`, the Email configuration set (now prefixed with app and env), queue and topic names over the new length limits, and Vpc subnets whose `az` letters aren't a, b, c in order: subnet ranges now follow the AZ letter, so any later `az` edit works. If that Vpc deploy fails with `InvalidSubnet.Conflict` (`["us-east-1b", "us-east-1c"]`, or an `az=N` Vpc that sits in an opted-in Local Zone), deploy once without the Vpc, then with it.
+
+### Bug Fixes
+
+- **Buckets and topics sending to one queue or topic all keep delivering**, and removing one no longer cuts off the rest. If your first deploy on this version also removes, renames or moves a sender, run `stlv refresh`, then `stlv deploy` after it.
+- **Dependency installs.** Wheels match the runtime's glibc, so packages like pyarrow no longer stop at an old version, and inline `requirements=[...]` works with pip 26. Dependency caches reinstall once.
+- **`RestApi` deploy fixes.** `cors` no longer fails at random with "Invalid Integration identifier specified", authorizer changes now reach the stage (APIs with an authorizer redeploy once), and routes like `/user-profiles` and `/user/profiles` no longer collide.
+- **Reading `api.url` or `bucket.arn` no longer locks the component.** Routes and notifications can still be added, and a function can link the API or bucket that calls it.
+- **`customize` reaches more resources.** App-wide dicts now apply to values Stelvio sets itself (DynamoTable `billing_mode`), Router's documented keys apply, and UserPool, RestApi, S3StaticWebsite, AppSync, `subscribe()` and `notify_function()` take new keys.
+- **App-wide `customize` callables can return only what they change.** A callable like `lambda props: {"memory_size": 1024}` used to drop every prop it didn't return: your arguments, the tags, even a function's code and handler. Spreading `props` was the only safe form; both work now.
+- **`stlv dev` runs each function like its Lambda.** Own links and CORS values per function, handler code reloaded on every request, and a crash or `sys.exit()` in a handler no longer stops the dev server.
+- **AppSync and Cognito child parenting.** Data sources, resolvers and pipe functions nest under `AppSync`, clients and identity providers under `UserPool`. Existing stacks migrate in place, no replacements.
+- **`stlv init --template` reports copy failures with a non-zero exit.** Clone errors, missing refs or template files, and conflicting paths leave the destination unchanged; an existing `stlv_app.py` still exits successfully. Omitting `@ref` uses the repository's default branch.
+
+## 0.10.0b6 (2026-09-10)
+
+### API Gateway v2 (HTTP API) Support
+
+Stelvio now supports AWS API Gateway v2 (HTTP API) with the new `HttpApi` component. It provides a simpler, faster, and cheaper alternative to the existing `RestApi` component.
+
+→ [HTTP API Guide](components/aws/http-api.md)
+
+### API Gateway v2 (WebSocket API) Support
+
+New `WebsocketApi` component for API Gateway v2 WebSocket APIs: `$connect`/`$disconnect`/`$default` and custom action routes on Lambda, Lambda or IAM auth on `$connect`, custom domains, and linking for the management API.
+
+→ [WebSocket API Guide](components/aws/websocket-api.md)
+
+`ApiDomain` now accepts `certificate_arn` so HttpApi and WebsocketApi users can attach an existing ACM certificate (for example a wildcard) instead of letting Stelvio issue one.
+
+### VPC
+
+New `Vpc` component for Amazon VPC networking. Creates a /16 VPC with an internet gateway and three subnet tiers — public, private, and isolated — each with one subnet and its own route table per availability zone. Optional managed NAT gateways give private subnets internet access — one per AZ (default) or a single shared gateway; optionally bring your own Elastic IPs via allocation IDs. Choose availability zones by count or by name.
+
+→ [VPC Guide](components/aws/vpc.md)
+
+### Dev Mode Enhancements
+
+Improved error handling and debugging in `stlv dev`: no longer silently returns None when the handler file is missing or the handler function name doesn't exist; sanitizing underscores as first character in app names.
+
+### Component Customization
+
+- Customization values can now be **callables** that receive the resource's props and return modified props, enabling dynamic customization based on component properties. Callables give full control—they receive component-level values and can decide how to merge them.
+- **Global `customize` dicts now act as defaults, not overrides.** Component-level values take precedence over global dict defaults. For example, with a global `memory=512` for all functions, `Function("my-fn", handler="...", memory=1024)` deploys with `1024`. (This precedence rule applies to dicts; callable customizers receive all values and decide their own precedence.)
+
+    → [Customization Guide](concepts/customization.md)
+
+### Breaking Changes
+- `Dns` adapters: the protocol is now a single `create_record` that returns `Record(resource, name)` and must accept a keyword-only `opts` parameter. See [Custom DNS adapters](concepts/dns.md#custom-dns-adapters).
+- `Api` component (AWS API Gateway v1) is renamed to `RestApi`. **Caution**: This change will affect existing deployments. Users with a custom domain should expect the update to fail on the duplicate domain: remove the custom domain first (by setting `custom_domain=None` and redeploy), then re-add it and deploy again. For users without a custom domain, the update should succeed without issues, but the `invoke_url` will change on redeploy. This behavior is expected as Stelvio will remove existing API and recreate it.
+
+    → [REST API Guide](components/aws/rest-api.md)
+
+### Bug Fixes
+
+- **DNS record and certificate parenting.** DNS records and the `AcmValidatedDomain` created by components are now parented under the owning component. Root-stack aliases migrate existing stacks in place, no replacements.
+- **Subscription parenting.** `TopicSubscription`, `TopicQueueSubscription`, `QueueSubscription`, `DynamoSubscription`, and `BucketNotifySubscription` are now parented under their owning `Topic`/`Queue`/`DynamoTable`/`Bucket`, so they nest in the resource tree and deploy output instead of sitting at the stack root. Root-stack aliases migrate existing stacks in place — no replacements. Subscription constructors also accept a keyword-only `parent`, matching `Function`.
+- **Default AWS region resolution.** With no `region` in `@app.config`, Stelvio now resolves the region once via the standard AWS chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, profile config) and uses it everywhere. Previously a missing region put a literal `None` into region-based values, breaking `IdentityPool` deploys and AppSync DynamoDB data sources — and setting only `AWS_REGION` (which boto3 ignores) didn't work. When no region can be resolved at all, Stelvio fails fast with a clear error.
+- **`DynamoTable` global index deprecation warnings.** Global secondary indexes no longer print `hashKey is deprecated` / `rangeKey is deprecated` on every deploy and diff. They now use the provider's `key_schemas` form. Existing tables see no diff, because the key schema is identical.
+- **`Bucket` versioning deprecation warning.** Buckets no longer print `versioning is deprecated`. Versioning is now a separate `BucketVersioning` resource, created only when `versioning=True`. Existing unversioned buckets see no diff. Existing versioned buckets gain a `BucketVersioning` resource, no replacement and no bucket update. Setting `versioning=False` on a versioned bucket suspends versioning, as S3 can't make a bucket unversioned again.
+- **`DynamoTable` field validation.** A `fields` entry that no key uses now raises when the table is defined, instead of failing mid-deploy with an AWS `ValidationException`. `fields` is only for key attributes: `partition_key`, `sort_key`, and index keys.
+
+## 0.9.0b5 (2026-04-13)
+
+### Cognito User Pools & Identity Pools
+
+New `UserPool` and `IdentityPool` components for user authentication with Amazon Cognito. Supports email/phone sign-in, app clients, social login providers, Lambda triggers, MFA, password policies, and SES email integration — with automatic IAM permission wiring via links. `IdentityPool` provides federated identities with authenticated and unauthenticated role management.
+
+→ [Cognito Guide](components/aws/cognito.md)
+
+### CLI
+
+- Redesign CLI output: component-grouped display with nested trees, property diffs, and data-loss replacement warnings for `diff`, `deploy`, `refresh`, and `destroy`.
+- Add `--json` summaries for all commands and `--stream` NDJSON output for `deploy` and `destroy`.
+- Redesign `stlv outputs` to show component URLs and user-defined exports separately.
+- Add `export_output` helper (`from stelvio import export_output`) for user-defined stack exports.
+- Add `--outputs` flag to `stlv state list` for debugging raw Pulumi outputs per resource.
+- Add structured CLI exit codes. Require explicit environment in CI.
+
+→ [Using Stelvio CLI](intro/using-cli.md)
+
+### Breaking Changes
+
+- **Automatic stack exports removed.** Components no longer call `pulumi.export()` automatically (e.g., `function_api_arn`, `queue_orders_url`). If you read stack outputs in scripts or CI, use `export_output()` in your `stlv_app.py` to explicitly export the values you need. Component URLs (Api, AppSync, etc.) are still shown in `stlv outputs` via `register_outputs`.
+
+### Python 3.14 Support
+
+Stelvio now supports Python 3.14.
+
+### Default App Config
+
+`@app.config` is now optional. If omitted, Stelvio uses `StelvioAppConfig()` with default values. Add `@app.config` only when you need to customize AWS settings, environments, tags, DNS, or component customizations.
+
+→ [StelvioApp Guide](concepts/stelvio-app.md)
+
+## 0.8.0b4 (2026-03-14)
+
+### AppSync 
+
+Stelvio now offers an `AppSync` component to manage GraphQL APIs with AWS AppSync.
+
+→ [AppSync Guide](components/aws/appsync.md)
+
+### Tagging
+
+Stelvio now supports tagging AWS resources at two levels:
+
+- Global tags in `StelvioAppConfig` apply to all AWS resources through provider default tags
+- Per-component tags let you override or extend tags for specific components
+
+Precedence: component \> global \> auto-tags (`stelvio:app`, `stelvio:env`)
+
+→ [Tagging Guide](concepts/tags.md)
+
+### Internals
+
+- Components are now Pulumi `ComponentResource` nodes with proper parent-child ownership in the resource tree
+
+### Breaking Changes
+
+- `customize` is now a keyword-only argument on all component constructors
+
+
+## 0.7.2b3 (2026-02-28)
+
+This is a bug-fix release.
+
+### Bug Fixes
+
+- Fix Route53 DNS adapter returning incorrect record value, which broke DNS validation when using Route53 as DNS provider
+- Fix FIFO queue subscribe creating invalid Lambda function names when queue name contains dots
+
+### Breaking Changes
+
+- **Email component output keys renamed**: Output keys now follow the same `{type}_{name}_{field}` underscore convention as all other components. If you read Pulumi outputs from the Email component, update your references (e.g. `notifications-ses-identity-arn` → `email_notifications_ses_identity_arn`). Note: auto-exported component outputs were later removed entirely in 0.8.0b5; use `export_output` for custom values.
+
+## 0.7.1b2 (2026-02-20)
+
+This is a bug-fix release.
+
+### DNS & Custom domain support
+
+- Fix a bug where `stelvio.aws.acm.AcmValidatedDomain` was not properly creating the validation record in `us-east-1` region, which is required for Cloudfront distributions.
+
+## 0.7.0b1 (2026-01-31)
+
+### Queues
+
+Stelvio now supports a `Queue` component to work with SQS Queues.
+
+→ [Queues Guide](components/aws/queues.md)
+
+### SNS Topics
+
+New `Topic` component for pub/sub messaging with Amazon SNS. Supports standard and FIFO topics, Lambda and SQS subscriptions, and filter policies for message routing.
+
+→ [SNS Topics Guide](components/aws/topics.md)
+
+### Email Sending
+
+Stelvio now offers an `Email` component to send emails using Amazon SES.
+
+→ [Email Guide](components/aws/email.md)
+
+### Scheduled Tasks with Cron
+
+New `Cron` component for running Lambda functions on a schedule using EventBridge Rules. Supports rate expressions (`rate(1 hour)`) and cron expressions (`cron(0 2 * * ? *)`), with options for custom payloads and resource linking.
+
+→ [Cron Guide](components/aws/cron.md)
+
+### Function-to-Function Linking
+
+Functions can now link to other functions, enabling Lambda-to-Lambda invocation. When you link a function to another, Stelvio automatically grants `lambda:InvokeFunction` permission and provides `function_arn` and `function_name` via the generated `Resources` object.
+
+→ [Lambda Functions Guide](components/aws/lambda.md#linking-to-other-functions)
+
+### Bucket Notifications
+
+Stelvio supports Bucket notification events. When an object in a bucket is created, modified, or deleted, you can notify a `Queue`, invoke a Lambda function or publish to an SNS topic.
+
+→ [Buckets Guide](components/aws/s3.md)
+
+### Pulumi Resource Customization
+
+This version allows overriding any underlying Pulumi resource property using the `customize` parameter, e.g.:
+
+```python
+bucket = Bucket("my-bucket", customize={"bucket": {"force_destroy": True}})
+```
+
+→ [Customization Guide](concepts/customization.md)
+
+### Full Payload Support in Dev Mode
+
+Dev mode now supports the same payload limits as Lambda: 6 MB (sync) and 1 MB (async).
+
+## 0.6.1a9 (2025-12-30)
+
+This is a bug-fix release.
+
+- Fix import handling for locally executed Lambda functions (dev mode)
+- Fix environment variables for locally executed Lambda functions (dev mode)
+
+## 0.6.0a8 (2025-12-25)
+
+We've been busy this holiday season! Here's our Christmas release 🎄
+
+### Dev Mode (`stlv dev`) 🚀
+
+Run your Lambda code locally while everything else stays in AWS:
+
+```bash
+stlv dev
+```
+
+Edit your function, hit refresh, see the result. No re-deploy, no waiting.
+
+- Instant code changes - just save and refresh
+- `print()` and exceptions appear right in your terminal
+- Attach your favorite debugger
+- Same API Gateway URL, same Function URLs - everything just works
+
+→ [Dev Mode Guide](concepts/dev-mode.md)
+
+### S3 State Sync
+
+Stelvio now stores infrastructure state in S3, making it ready for teams:
+
+- **Shared state** - Multiple developers work on the same app without file syncing
+- **Locking** - Concurrent deployments are blocked to prevent conflicts
+- **Crash recovery** - State saves continuously; interrupted deploys resume cleanly
+- **Operation history** - Track deployments across your team
+
+State is stored in S3 bucket automatically. No configuration needed.
+
+→ [State Management Guide](concepts/state.md)
+
+### CloudFront Router
+
+New `Router` component for CloudFront-based routing with multiple origins - route different paths to API Gateway, Lambda Function URLs, or other backends.
+
+→ [CloudFront Router Guide](components/aws/cloudfront-router.md)
+
+### Lambda Function URLs
+
+Direct HTTP access to Lambda functions:
+
+```python
+my_function = Function("my-func", handler="handler.main", url="public")
+```
+
+→ [Function URLs Guide](components/aws/lambda.md#function-urls)
+
+### Other Improvements
+
+- **Cognito scopes** - OAuth scope validation on API Gateway routes
+- **Simplified DynamoDB subscriptions** - Cleaner `subscribe()` API
+- **AWS profile/region** - Properly respects system settings
+
+### Notes
+
+Auto-generated routing for multiple handlers in the same file has been removed. Routes now create separate Lambda functions. To share a Lambda, use an explicit `Function` instance.
+
+## 0.5.0a7 (2025-10-31)
+
+With this release, Stelvio gets:
+
+- a S3StaticWebsite component for S3 static website hosting with CloudFront CDN and optional custom domain support 
+- support for DynamoDB streams and subscriptions.
+- support for Authorizers and CORS for `Api`
+
+### Static Website Hosting with S3 and CloudFront
+- Added `stelvio.aws.s3.S3StaticWebsite` for managing S3 buckets for static website hosting with CloudFront CDN and optional custom domain support
+
+### DynamoDB Streams
+- Added `stream` property and `subscribe` method to the `DynamoTable` component so you can easily enable streams and add lambda that listens to the changes in the table.
+
+### Api gateway authorizers
+- Added `add_token_authorizer`, `add_request_authorizer` and `add_cognito_authorizer` so you can add different authorizers.
+- Added `default_auth` property to set default authorizers for all endpoints and methods
+- Added `auth` param to the `route` method to set authorizer on per route basis.
+
+### Api gateway CORS
+
+- Added `CorsConfig` and `CorsConfigDict` classes that can be used to pass to the new `cors` param of `Api` and its config classes(`ApiConfig` and `ApiConfigDict`) to configure cors settings of your Api gateway. 
+
+## 0.4.0a6 (2025-09-05)
+
+With this release, S3 buckets, custom domains (including Cloudflare) for ApiGateway and DynamoDB Indexes are supported.
+
+### DNS & Custom domain support
+- Added `stelvio.aws.route53.Route53Dns` for managing DNS records in AWS Route 53
+- Added `stelvio.cloudflare.dns.CloudflareDns` for managing DNS records in Cloudflare
+- Added `stelvio.aws.acm.AcmValidatedDomain` for managing TLS certificates for custom domains in AWS
+- Stelvio now automatically creates and validates TLS certificates for custom domains
+
+### S3 Bucket Support
+- Added `stelvio.aws.s3.Bucket` for managing S3 buckets
+
+### DynamoDb Indexes Support
+- Added support for DynamoDB local and global indexes.
+
+### Internal improvements & Fixes
+- better docs
+- `DynamoTableConfig`
+- fix so now we can have same routes in different API Gateways
+- fix to make sure generated roles and policy names with within AWS limits
+- fixed flaky tests
+- properly handling  API Gateway account and role and correctly displaying in CLI 
+
+## 0.3.0a5 (2025-07-14)
+
+### 🎉 Major Release: Complete CLI Experience
+
+This release transforms Stelvio from a library into a complete development 
+platform with a dedicated CLI.
+
+#### Stelvio CLI (`stlv` command)
+
+- **`stlv init`** - Initialize new projects with interactive AWS setup
+- **`stlv deploy`** - Deploy with real-time progress display
+- **`stlv diff`** - Preview changes before deploying  
+- **`stlv destroy`** - Clean up resources safely
+- **`stlv refresh`** - Sync state with actual AWS resources
+- **`stlv version`** - Check your Stelvio version
+
+#### Automatic Pulumi Management
+
+- Zero-setup deployment - Pulumi installed automatically
+- No more manual Pulumi configuration or project setup
+
+#### Environments
+
+- Personal environments (defaults to your username)
+- Shared environments for team collaboration
+- Environment-specific resource naming and isolation
+
+#### Automatic Passphrase Management
+
+- Generates and stores passphrases in AWS Parameter Store
+- No more manual passphrase handling
+
+#### Rich Console Output 🎨
+
+- Color-coded operations (green=create, yellow=update, red=delete)
+- Real-time deployment progress with operation timing
+- Resource grouping and operation summaries
+- Optional `--show-unchanged` flag for detailed views
+
+
+#### New StelvioApp Architecture
+
+- Clean decorator-based configuration with `@app.config` and `@app.run`
+
+#### Consistent Resource Naming
+
+- All resources get `{app}-{env}-{name}` naming pattern
+- Prevents resource collisions across different deployments
+
+#### Enhanced API Gateway Support
+
+- Fixed multiple environment deployment issues
+- Handles existing CloudWatch roles correctly
+
+#### 🐛 Bug Fixes & Improvements
+
+- Better error messages and debugging information
+- Improved logging system
+- Enhanced confirmation prompts for destructive operations
+
+## 0.2.0a4 (2025-05-14)
+
+- Lambda Function dependencies
+- Lambda Layers
+- More tests for faster future progress
+
+## 0.1.0a2 (2025-02-14)
+
+- Maintenance release
+- Fixed bug when route couldn't be created if it had just default config
+- Added better checks so Stelvio informs you if there's route conflicts
+- Added tests
+
+
+
+## 0.1.0a1 (2025-01-31)
+
+- Initial release
+- Very basic support for:
+
+    - AWS Lambda
+    - Dynamo DB Table
+    - API Gateway

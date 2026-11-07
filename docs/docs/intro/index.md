@@ -1,0 +1,140 @@
+# Welcome to Stelvio
+
+Stelvio is a Python framework that makes AWS development simple for Python devs. 
+
+It lets you build and deploy AWS applications using pure Python code and a simple CLI, without dealing with complex infrastructure tools.
+
+**Head over to the _[Quick Start](quickstart.md)_ guide to get started.**
+
+!!! note "Beta"
+    Stelvio is actively developed and currently in beta. The core features are stable and ready for real projects, though some APIs may evolve as we refine the developer experience.
+
+    Supports Lambda, API Gateway, DynamoDB, DocumentDB, VPC, S3, SQS, SNS, SES, custom domains, CloudFront routing, Cron, AppSync, Cognito, and more coming soon.
+
+## Why We're Built This
+
+As a Python developers working with AWS, I got tired of:
+
+- Switching between YAML, JSON, and other config formats
+- Figuring out IAM roles and permissions
+- Managing infrastructure separately from my code
+- Clicking through endless AWS console screens
+- Writing and maintaining complex infrastructure code
+
+We wanted to focus on building applications, not fighting with infrastructure. That's 
+why we created Stelvio.
+
+## How It Works
+
+Here's how simple it is to create and deploy an API with Stelvio:
+
+```py
+from stelvio.app import StelvioApp
+
+app = StelvioApp("my-api")
+
+@app.run
+def run() -> None:
+    from stelvio.aws.api_gateway import RestApi
+
+    api = RestApi('my-api')
+    api.route('GET', '/users', 'users/handler.get')
+    api.route('POST', '/users', 'users/handler.create')
+```
+
+Then deploy with one command:
+```bash
+stlv deploy
+```
+
+Stelvio takes care of everything else:
+
+- Creates Lambda functions automatically
+- Sets up API Gateway with routing
+- Handles IAM roles and permissions
+- Manages environment variables
+- Deploys everything to AWS
+
+## What Makes It Different
+
+### Zero-Setup CLI
+Get started in seconds with `stlv init`. No complex configuration, no manual tool installation, no YAML files. Just install Stelvio and start deploying.
+
+### Just Python
+Write everything in Python. No new tools or languages to learn. If you know Python, you know how to use Stelvio.
+
+### Environments Built-In
+Deploy to your personal environment by default, or share staging/production environments with your team. All resources are automatically isolated and named.
+
+### Smart Defaults That Make Sense
+Start simple with sensible defaults. Add configuration only when you need it. Simple things stay simple, but you still have full control when you need it.
+
+### Type Safety That Actually Helps
+Get IDE support and type checking for all your AWS resources. No more guessing about environment variables or resource configurations.
+
+## Ready to Try It?
+
+Head over to the [Quick Start](quickstart.md) guide to get started.
+
+## What I Believe In
+
+I built Stelvio believing that:
+
+1. Infrastructure should feel natural in your Python code
+2. You shouldn't need to become an AWS expert
+3. Simple things should be simple
+4. Your IDE should help you catch problems early
+5. Good defaults beat endless options
+6. Developer experience matters as much as functionality
+
+## Let's Talk
+
+- Found a bug or want a feature? [Open an issue](https://github.com/stelviodev/stelvio/issues)
+- Have questions? [Join the discussion](https://github.com/stelviodev/stelvio/discussions)
+- Want updates and tips? [Follow us on X](https://x.com/stelviodev)
+
+## License
+
+Stelvio is released under the Apache 2.0 License. See the LICENSE file for details.
+
+## Where to go from here
+
+### Getting Started
+
+- [Quick Start](quickstart.md) - Deploy your first app in minutes
+- [StelvioApp and stlv_app.py](../concepts/stelvio-app.md) - App structure and AWS setup
+- [Environments](../concepts/environments.md) - Personal and team environments
+
+### Guides
+
+- [`stlv dev`](../concepts/dev-mode.md) - Execute Lambda Functions locally
+- [Using CLI](using-cli.md) - The `stlv` CLI
+- [REST APIs](../components/aws/rest-api.md) - Build REST APIs with API Gateway
+- [HTTP APIs](../components/aws/http-api.md) - Build HTTP APIs with API Gateway
+- [Websocket APIs](../components/aws/websocket-api.md) - Build Websocket APIs with API Gateway
+- [Lambda Functions](../components/aws/lambda.md) - Serverless functions with Python
+- [Queues](../components/aws/queues.md) - Serverless queues with SQS
+- [SNS Topics](../components/aws/topics.md) - Pub/sub messaging with SNS
+- [Dynamo DB](../components/aws/dynamo-db.md) - Serverless NoSQL Database
+- [S3 Buckets](../components/aws/s3.md) - AWS S3 (Object Storage)
+- [Cron](../components/aws/cron.md) - Scheduled tasks with EventBridge
+- [Linking](../concepts/linking.md) - Automatic IAM permissions
+- [DNS](../concepts/dns.md) - Custom domains and TLS certificates
+- [Router](../components/aws/cloudfront-router.md) - Routing components on one domain
+- [Email](../components/aws/email.md) - Send emails using SES
+- [AppSync](../components/aws/appsync.md) - Manage GraphQL APIs with AWS AppSync
+- [Cognito](../components/aws/cognito.md) - User pools and identity pools
+- [VPC](../components/aws/vpc.md) - Networking with Amazon VPC
+- [DocumentDB](../components/aws/document-db.md) - Amazon DocumentDB clusters
+- [Project Structure](project-structure.md) - Organizing your code
+- [State Management](../concepts/state.md) - Understand Deployment State
+- [Parameter Customization](../concepts/customization.md) - Customize internals of cloud primitives
+- [Tagging](../concepts/tags.md) - Global and per-component AWS resource tags
+- [Other AWS Resources](../concepts/other-aws-resources.md) - AWS resources Stelvio doesn't support
+- [Troubleshooting](troubleshooting.md) - Common misconceptions
+
+### Reference
+
+- [CLI Commands](using-cli.md) - All stlv commands
+- [State Management](../concepts/state.md) - How Stelvio manages state
+- [Troubleshooting](troubleshooting.md) - Debug common issues

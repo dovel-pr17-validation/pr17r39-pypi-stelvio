@@ -1,0 +1,1167 @@
+import pulumi
+from pytest import mark, param, raises
+
+from stelvio.aws.api_gateway import HttpApi, RestApi
+from stelvio.aws.cloudfront.js import strip_path_pattern_function_js
+from stelvio.aws.cloudfront.router import Router
+from stelvio.aws.function import Function
+from stelvio.aws.function import function as function_module
+from stelvio.aws.s3.s3 import Bucket
+from stelvio.dns import DnsProviderNotConfiguredError
+
+from ...conftest import TP
+from ..conftest import (
+    assert_hash_truncated,
+    assert_urn,
+    create_app_context_with_global_customize,
+    set_app_and_env_names,
+)
+from ..pulumi_mocks import ACCOUNT_ID, DEFAULT_REGION, R, tid, tn
+
+
+def test_create_resources_with_s3_bucket(pulumi_mocks):
+    """Test that Router creates proper CloudFront resources for S3 bucket origin."""
+    bucket = Bucket("test-bucket")
+    router = Router(name="test-router")
+    router.route("/static", bucket)
+
+    @pulumi.runtime.test
+    def deploy():
+        return [bucket.resources, router.resources]
+
+    deploy()
+
+    origin_id = f"arn:aws:s3:::{tn(TP + 'test-bucket')}"
+    functions_arn = f"arn:aws:cloudfront::{ACCOUNT_ID}:function"
+    not_found_arn = f"{functions_arn}/{tn(TP + 'test-router-default-404')}"
+    rewrite_arn = f"{functions_arn}/{tn(TP + 'test-router-test-bucket-rw')}"
+    pulumi_mocks.assert_res(
+        "test-router",
+        R.DISTRIBUTION,
+        {
+            "enabled": True,
+            "isIpv6Enabled": True,
+            "priceClass": "PriceClass_100",
+            "viewerCertificate": {"cloudfrontDefaultCertificate": True},
+            "restrictions": {"geoRestriction": {"restrictionType": "none"}},
+            "origins": [
+                {
+                    "originId": origin_id,
+                    "domainName": f"{tn(TP + 'test-bucket')}.s3.{DEFAULT_REGION}.amazonaws.com",
+                    "originAccessControlId": tid(TP + "test-router-test-bucket-oac"),
+                }
+            ],
+            "defaultCacheBehavior": {
+                "targetOriginId": origin_id,
+                "allowedMethods": ["GET", "HEAD", "OPTIONS"],
+                "cachedMethods": ["GET", "HEAD"],
+                "compress": True,
+                "viewerProtocolPolicy": "redirect-to-https",
+                "forwardedValues": {
+                    "queryString": False,
+                    "cookies": {"forward": "none"},
+                    "headers": [],
+                },
+                "minTtl": 0,
+                "defaultTtl": 0,
+                "maxTtl": 0,
+                "functionAssociations": [
+                    {"eventType": "viewer-request", "functionArn": not_found_arn}
+                ],
+            },
+            "orderedCacheBehaviors": [
+                {
+                    "pathPattern": "/static/*",
+                    "targetOriginId": origin_id,
+                    "allowedMethods": ["GET", "HEAD", "OPTIONS"],
+                    "cachedMethods": ["GET", "HEAD"],
+                    "compress": True,
+                    "viewerProtocolPolicy": "redirect-to-https",
+                    "forwardedValues": {
+                        "queryString": False,
+                        "cookies": {"forward": "none"},
+                        "headers": ["If-Modified-Since"],
+                    },
+                    "minTtl": 0,
+                    "defaultTtl": 86400,
+                    "maxTtl": 31536000,
+                    "functionAssociations": [
+                        {"eventType": "viewer-request", "functionArn": rewrite_arn}
+                    ],
+                }
+            ],
+        },
+    )
+    pulumi_mocks.assert_res(
+        "test-router-test-bucket-oac",
+        R.ORIGIN_ACCESS_CONTROL,
+        {
+            "description": "Origin Access Control for test-bucket",
+            "originAccessControlOriginType": "s3",
+            "signingBehavior": "always",
+            "signingProtocol": "sigv4",
+        },
+    )
+    pulumi_mocks.assert_res_counts(
+        {
+            R.BUCKET: 1,
+            R.BUCKET_PUBLIC_ACCESS_BLOCK: 1,
+            R.DISTRIBUTION: 1,
+            R.ORIGIN_ACCESS_CONTROL: 1,
+            # URI rewrite + default 404
+            R.CLOUDFRONT_FUNCTION: 2,
+            R.BUCKET_POLICY: 1,
+        }
+    )
+
+
+@pulumi.runtime.test
+def test_create_resources_no_routes_raises_error(pulumi_mocks):
+    """Test that creating resources with no routes raises ValueError."""
+    router = Router(name="test-router")
+
+    with raises(ValueError, match="must have at least one route"):
+        router._create_resources()
+
+
+def _rest_api():
+    api = RestApi("api")
+    api.route("GET", "/", "functions/simple.handler")
+    return api
+
+
+def _http_api():
+    api = HttpApi("api")
+    api.route("GET", "/", "functions/simple.handler")
+    return api
+
+
+API_METHODS = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+CACHING_DISABLED_POLICY_ID = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+# No Host: API Gateway answers a foreign Host with 403
+ALL_VIEWER_EXCEPT_HOST_HEADER_POLICY_ID = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+API_RESOURCES = {
+    R.API_ACCOUNT: 2,
+    R.LOG_GROUP: 1,
+    R.ROLE: 2,
+    R.ROLE_POLICY_ATTACHMENT: 1,
+    R.FUNCTION: 1,
+    R.LAMBDA_PERMISSION: 1,
+    R.DISTRIBUTION: 1,
+}
+
+
+@mark.parametrize(
+    ("make_origin", "default_behavior", "counts"),
+    [
+        param(
+            lambda: Bucket("site"),
+            {
+                "allowedMethods": ["GET", "HEAD", "OPTIONS"],
+                "cachedMethods": ["GET", "HEAD"],
+                "compress": True,
+                "viewerProtocolPolicy": "redirect-to-https",
+                "forwardedValues": {
+                    "queryString": False,
+                    "cookies": {"forward": "none"},
+                    "headers": ["If-Modified-Since"],
+                },
+                "minTtl": 0,
+                "defaultTtl": 86400,
+                "maxTtl": 31536000,
+                "functionAssociations": [],
+            },
+            {
+                R.BUCKET: 1,
+                R.BUCKET_PUBLIC_ACCESS_BLOCK: 1,
+                R.ORIGIN_ACCESS_CONTROL: 1,
+                R.BUCKET_POLICY: 1,
+                R.DISTRIBUTION: 1,
+            },
+            id="bucket",
+        ),
+        param(
+            _rest_api,
+            {
+                "allowedMethods": API_METHODS,
+                "cachedMethods": ["GET", "HEAD"],
+                "viewerProtocolPolicy": "redirect-to-https",
+                "cachePolicyId": CACHING_DISABLED_POLICY_ID,
+                "originRequestPolicyId": ALL_VIEWER_EXCEPT_HOST_HEADER_POLICY_ID,
+                "functionAssociations": [],
+            },
+            API_RESOURCES
+            | {
+                R.REST_API: 1,
+                R.API_METHOD: 1,
+                R.API_INTEGRATION: 1,
+                R.API_DEPLOYMENT: 1,
+                R.API_STAGE: 1,
+            },
+            id="rest-api",
+        ),
+        param(
+            _http_api,
+            {
+                "allowedMethods": API_METHODS,
+                "cachedMethods": ["GET", "HEAD"],
+                "viewerProtocolPolicy": "redirect-to-https",
+                "cachePolicyId": CACHING_DISABLED_POLICY_ID,
+                "originRequestPolicyId": ALL_VIEWER_EXCEPT_HOST_HEADER_POLICY_ID,
+                "functionAssociations": [],
+            },
+            API_RESOURCES
+            | {
+                R.HTTP_API: 1,
+                R.HTTP_API_INTEGRATION: 1,
+                R.HTTP_API_ROUTE: 1,
+                R.HTTP_API_STAGE: 1,
+            },
+            id="http-api",
+        ),
+        param(
+            lambda: Function("fn", handler="functions/simple.handler"),
+            {
+                "allowedMethods": API_METHODS,
+                "cachedMethods": ["GET", "HEAD"],
+                "viewerProtocolPolicy": "redirect-to-https",
+                "cachePolicyId": CACHING_DISABLED_POLICY_ID,
+                "originRequestPolicyId": ALL_VIEWER_EXCEPT_HOST_HEADER_POLICY_ID,
+                "functionAssociations": [],
+            },
+            {
+                R.FUNCTION: 1,
+                R.ROLE: 1,
+                R.ROLE_POLICY_ATTACHMENT: 1,
+                R.FUNCTION_URL: 1,
+                R.ORIGIN_ACCESS_CONTROL: 1,
+                R.LAMBDA_PERMISSION: 1,
+                R.DISTRIBUTION: 1,
+            },
+            id="function",
+        ),
+        param(
+            lambda: "https://example.com",
+            {
+                "allowedMethods": API_METHODS,
+                "cachedMethods": ["GET", "HEAD"],
+                "compress": True,
+                "viewerProtocolPolicy": "redirect-to-https",
+                "forwardedValues": {
+                    "queryString": True,
+                    "cookies": {"forward": "all"},
+                    "headers": ["*"],
+                },
+                "minTtl": 0,
+                "defaultTtl": 0,
+                "maxTtl": 0,
+                "functionAssociations": [],
+                # The mocks leave the Lambda@Edge `qualified_arn` unset, so no `lambdaArn`.
+                "lambdaFunctionAssociations": [
+                    {"eventType": "origin-request", "includeBody": True}
+                ],
+            },
+            # The Lambda@Edge Host rewrite: function, role, policy attachment
+            {R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1, R.DISTRIBUTION: 1},
+            id="url",
+        ),
+    ],
+)
+# "" was a working catch-all before `/` was fixed; it stays one.
+@mark.parametrize("path", ["/", "/*", ""])
+@mark.usefixtures("mock_get_or_install_dependencies_function", "project_cwd")
+def test_root_route_behavior_is_the_default_behavior(
+    pulumi_mocks, path, make_origin, default_behavior, counts
+):
+    """The root used to get a fixed GET-only template, so a POST to an API on `/` got
+    CloudFront's 403. No prefix-strip function: it would run, and bill, on every request."""
+    router = Router("router")
+    router.route(path, make_origin())
+
+    @pulumi.runtime.test
+    def deploy():
+        return router.resources
+
+    deploy()
+
+    distribution = pulumi_mocks.assert_res("router", R.DISTRIBUTION)
+    [origin] = distribution.inputs["origins"]
+    assert distribution.inputs["defaultCacheBehavior"] == {
+        "targetOriginId": origin["originId"],
+        **default_behavior,
+    }
+    assert "orderedCacheBehaviors" not in distribution.inputs
+    assert router.resources.cloudfront_functions == []
+    pulumi_mocks.assert_res_counts(counts)
+
+
+@mark.usefixtures("mock_get_or_install_dependencies_function", "project_cwd")
+def test_root_route_next_to_other_routes(pulumi_mocks):
+    """The root route takes the default behavior; the other routes keep theirs in order."""
+
+    @pulumi.runtime.test
+    def deploy():
+        router = Router("router")
+        router.route("/", Bucket("site"))
+        router.route("/api", _rest_api())
+        return router.resources
+
+    deploy()
+
+    distribution = pulumi_mocks.assert_res("router", R.DISTRIBUTION)
+    assert distribution.inputs["defaultCacheBehavior"] == {
+        "targetOriginId": f"arn:aws:s3:::{tn(TP + 'site')}",
+        "allowedMethods": ["GET", "HEAD", "OPTIONS"],
+        "cachedMethods": ["GET", "HEAD"],
+        "compress": True,
+        "viewerProtocolPolicy": "redirect-to-https",
+        "forwardedValues": {
+            "queryString": False,
+            "cookies": {"forward": "none"},
+            "headers": ["If-Modified-Since"],
+        },
+        "minTtl": 0,
+        "defaultTtl": 86400,
+        "maxTtl": 31536000,
+        "functionAssociations": [],
+    }
+    behaviors = distribution.inputs["orderedCacheBehaviors"]
+    assert [(b["pathPattern"], b["targetOriginId"]) for b in behaviors] == [
+        ("/api", tid(TP + "api")),
+        ("/api/*", tid(TP + "api")),
+    ]
+    pulumi_mocks.assert_res(
+        "router-api-rw",
+        R.CLOUDFRONT_FUNCTION,
+        {"code": strip_path_pattern_function_js("/api")},
+        partial=True,
+    )
+    pulumi_mocks.assert_res_counts(
+        API_RESOURCES
+        | {
+            R.REST_API: 1,
+            R.API_METHOD: 1,
+            R.API_INTEGRATION: 1,
+            R.API_DEPLOYMENT: 1,
+            R.API_STAGE: 1,
+            R.CLOUDFRONT_FUNCTION: 1,
+            R.BUCKET: 1,
+            R.BUCKET_PUBLIC_ACCESS_BLOCK: 1,
+            R.ORIGIN_ACCESS_CONTROL: 1,
+            R.BUCKET_POLICY: 1,
+        }
+    )
+
+
+def _rest_api_root_next_to_a_bucket(router):
+    router.route("/", _rest_api())
+    router.route("/static", Bucket("static"))
+
+
+@mark.parametrize(
+    ("add_routes", "scope", "expected"),
+    [
+        param(lambda router: router.route("/", Bucket("site")), None, "index.html", id="bucket"),
+        param(
+            lambda router: router.route("/*", Bucket("site")), None, "index.html", id="bucket-/*"
+        ),
+        param(
+            lambda router: router.route("/", Bucket("site")),
+            "instance",
+            "home.html",
+            id="bucket-instance-customize",
+        ),
+        param(
+            lambda router: router.route("/", Bucket("site")),
+            "global",
+            "home.html",
+            id="bucket-global-customize",
+        ),
+        # A Bucket elsewhere on the router doesn't count: `/` stays the API's.
+        param(_rest_api_root_next_to_a_bucket, None, None, id="rest-api-root"),
+    ],
+)
+@mark.usefixtures("mock_get_or_install_dependencies_function", "project_cwd")
+def test_root_route_default_root_object(pulumi_mocks, add_routes, scope, expected):
+    """`GET /` on a root bucket would ask S3 for the bucket root: 403."""
+    customize = {"distribution": {"default_root_object": "home.html"}}
+    if scope == "global":
+        create_app_context_with_global_customize({Router: customize})
+
+    @pulumi.runtime.test
+    def deploy():
+        router = Router("router", customize=customize if scope == "instance" else None)
+        add_routes(router)
+        return router.resources
+
+    deploy()
+
+    distribution = pulumi_mocks.assert_res("router", R.DISTRIBUTION)
+    assert distribution.inputs.get("defaultRootObject") == expected
+
+
+def test_slash_star_root_leaves_same_length_routes_reachable(pulumi_mocks):
+    """`/x` sorts level with `/*` (same length); as an ordered behavior `/*` would sit first
+    and catch `/x` too."""
+
+    @pulumi.runtime.test
+    def deploy():
+        router = Router("router")
+        router.route("/*", Bucket("site"))
+        router.route("/x", Bucket("x"))
+        return router.resources
+
+    deploy()
+
+    distribution = pulumi_mocks.assert_res("router", R.DISTRIBUTION)
+    default_behavior = distribution.inputs["defaultCacheBehavior"]
+    assert default_behavior["targetOriginId"] == f"arn:aws:s3:::{tn(TP + 'site')}"
+    [x_behavior] = distribution.inputs["orderedCacheBehaviors"]
+    assert x_behavior["pathPattern"] == "/x/*"
+    assert x_behavior["targetOriginId"] == f"arn:aws:s3:::{tn(TP + 'x')}"
+    pulumi_mocks.assert_res_counts(
+        {
+            R.BUCKET: 2,
+            R.BUCKET_PUBLIC_ACCESS_BLOCK: 2,
+            R.ORIGIN_ACCESS_CONTROL: 2,
+            R.BUCKET_POLICY: 2,
+            R.CLOUDFRONT_FUNCTION: 1,  # /x's prefix strip
+            R.DISTRIBUTION: 1,
+        }
+    )
+
+
+def test_customized_function_code_stays_on_root_and_wildcard_routes(pulumi_mocks):
+    """Only the generated no-op rewrite is skipped on `/` and `/files/*`: a user's own
+    `cloudfront_functions` code still gets a function on each route and its association."""
+    code = "function handler(event) { return event.request; }"
+
+    @pulumi.runtime.test
+    def deploy():
+        router = Router("router", customize={"cloudfront_functions": {"code": code}})
+        router.route("/", Bucket("site"))
+        router.route("/files/*", Bucket("files"))
+        return router.resources
+
+    deploy()
+
+    pulumi_mocks.assert_res("router-files-rw", R.CLOUDFRONT_FUNCTION, {"code": code}, partial=True)
+    pulumi_mocks.assert_res("router-site-rw", R.CLOUDFRONT_FUNCTION, {"code": code}, partial=True)
+    functions_arn = f"arn:aws:cloudfront::{ACCOUNT_ID}:function"
+    distribution = pulumi_mocks.assert_res("router", R.DISTRIBUTION)
+    assert distribution.inputs["defaultCacheBehavior"]["functionAssociations"] == [
+        {
+            "eventType": "viewer-request",
+            "functionArn": f"{functions_arn}/{tn(TP + 'router-site-rw')}",
+        }
+    ]
+    [files] = distribution.inputs["orderedCacheBehaviors"]
+    assert files["functionAssociations"] == [
+        {
+            "eventType": "viewer-request",
+            "functionArn": f"{functions_arn}/{tn(TP + 'router-files-rw')}",
+        }
+    ]
+    pulumi_mocks.assert_res_counts(
+        {
+            R.BUCKET: 2,
+            R.BUCKET_PUBLIC_ACCESS_BLOCK: 2,
+            R.BUCKET_POLICY: 2,
+            R.ORIGIN_ACCESS_CONTROL: 2,
+            R.CLOUDFRONT_FUNCTION: 2,  # the customized ones, no default 404 with a root route
+            R.DISTRIBUTION: 1,
+        }
+    )
+
+
+@mark.usefixtures("mock_get_or_install_dependencies_function", "project_cwd")
+@mark.parametrize(
+    ("files_path", "fn_path", "url_path", "url_origin_id"),
+    # a URL route's origin id is the router name and a hash of the route path
+    [
+        param("/files/*", "/w/*", "/u/*", "router-url-e941f502", id="trailing"),
+        param("/files/*.txt", "/w/*/end", "/u/*.jpg", "router-url-99e46910", id="mid-path"),
+    ],
+)
+def test_wildcard_routes_pass_the_path_through(
+    pulumi_mocks, files_path, fn_path, url_path, url_origin_id
+):
+    """A wildcard route gets one behavior and no prefix-strip function: the origin sees the
+    full path."""
+
+    @pulumi.runtime.test
+    def deploy():
+        router = Router("router")
+        router.route(files_path, Bucket("files"))
+        router.route(fn_path, Function("fn", handler="functions/simple.handler"))
+        router.route(url_path, "https://example.com")
+        return router.resources
+
+    deploy()
+
+    distribution = pulumi_mocks.assert_res("router", R.DISTRIBUTION)
+    behaviors = distribution.inputs["orderedCacheBehaviors"]
+    assert [
+        (b["pathPattern"], b["targetOriginId"], b["functionAssociations"]) for b in behaviors
+    ] == [
+        (files_path, f"arn:aws:s3:::{tn(TP + 'files')}", []),
+        (fn_path, tn(TP + "fn"), []),
+        (url_path, TP + url_origin_id, []),
+    ]
+    pulumi_mocks.assert_res("router-default-404", R.CLOUDFRONT_FUNCTION)
+    pulumi_mocks.assert_res_counts(
+        {
+            R.BUCKET: 1,
+            R.BUCKET_PUBLIC_ACCESS_BLOCK: 1,
+            R.BUCKET_POLICY: 1,
+            R.FUNCTION: 2,  # the routed Function + the URL route's Lambda@Edge
+            R.ROLE: 2,
+            R.ROLE_POLICY_ATTACHMENT: 2,
+            R.FUNCTION_URL: 1,
+            R.LAMBDA_PERMISSION: 1,
+            R.ORIGIN_ACCESS_CONTROL: 2,
+            R.CLOUDFRONT_FUNCTION: 1,  # the default 404
+            R.DISTRIBUTION: 1,
+        }
+    )
+
+
+def test_create_resources_with_multiple_routes(pulumi_mocks):
+    """Test that Router handles multiple routes correctly."""
+    bucket1 = Bucket("bucket1")
+    bucket2 = Bucket("bucket2")
+    router = Router(name="test-router")
+    router.route("/static", bucket1)
+    router.route("/files", bucket2)
+
+    @pulumi.runtime.test
+    def deploy():
+        return [bucket1.resources, bucket2.resources, router.resources]
+
+    deploy()
+
+    assert len(pulumi_mocks.created(R.DISTRIBUTION)) == 1
+    # One OAC per bucket
+    assert sorted(oac.name for oac in pulumi_mocks.created(R.ORIGIN_ACCESS_CONTROL)) == [
+        TP + "test-router-bucket1-oac",
+        TP + "test-router-bucket2-oac",
+    ]
+
+
+def test_create_resources_custom_domain_no_dns_raises_error():
+    """Test that custom_domain without DNS provider raises DnsProviderNotConfiguredError.
+
+    Note: This test doesn't need Pulumi mocks because it tests the error before
+    resources are created.
+    """
+    bucket = Bucket("test-bucket")
+
+    router = Router(name="test-router", custom_domain="example.com")
+    router.route("/", bucket)
+
+    # Should raise DnsProviderNotConfiguredError because default context has no DNS
+    with raises(DnsProviderNotConfiguredError, match="DNS not configured"):
+        router._create_resources()
+
+
+def test_create_resources_with_custom_domain_and_dns(pulumi_mocks, app_context_with_dns):
+    """Test that Router creates ACM certificate and DNS record with custom domain."""
+    custom_domain = "cdn-custom-domain-dns.example.com"
+
+    bucket = Bucket("test-bucket")
+    router = Router(name="test-router-custom-domain-dns", custom_domain=custom_domain)
+    router.route("/", bucket)
+
+    @pulumi.runtime.test
+    def deploy():
+        return [bucket.resources, router.resources]
+
+    deploy()
+
+    certificate_name = "test-router-custom-domain-dns-acm-validated-domain-certificate"
+    certificate_id = tid(TP + certificate_name)
+    certificate_arn = f"arn:aws:acm:{DEFAULT_REGION}:{ACCOUNT_ID}:certificate/{certificate_id}"
+    pulumi_mocks.assert_res(
+        certificate_name, R.CERTIFICATE, {"domainName": custom_domain}, partial=True
+    )
+    pulumi_mocks.assert_res(
+        f"{certificate_name}-validation",
+        R.CERTIFICATE_VALIDATION,
+        {"certificateArn": certificate_arn},
+        partial=True,
+    )
+
+    pulumi_mocks.assert_res(
+        "test-router-custom-domain-dns-cloudfront-record",
+        R.CLOUDFLARE_RECORD,
+        {
+            "zoneId": "test-zone-id",
+            "name": custom_domain,
+            "type": "CNAME",
+            "content": f"{tid(TP + 'test-router-custom-domain-dns')}.cloudfront.net",
+            "ttl": 1,
+        },
+    )
+
+    pulumi_mocks.assert_res(
+        "test-router-custom-domain-dns",
+        R.DISTRIBUTION,
+        {
+            "aliases": [custom_domain],
+            "viewerCertificate": {
+                "acmCertificateArn": certificate_arn,
+                "sslSupportMethod": "sni-only",
+                "minimumProtocolVersion": "TLSv1.2_2021",
+            },
+        },
+        partial=True,
+    )
+
+
+@pulumi.runtime.test
+def test_router_parented(pulumi_mocks, app_context_with_dns):
+    bucket = Bucket("test-bucket-parented")
+    _ = bucket.resources
+
+    router = Router(name="test-router-parented", custom_domain="cdn-parented.example.com")
+    router.route("/", bucket)
+    record = router.resources.record
+    acm = router.resources.acm_validated_domain
+    assert record is not None
+    assert acm is not None
+
+    def check(urns):
+        record_urn, acm_urn = urns
+        assert_urn(
+            record_urn,
+            "stelvio:aws:Router",
+            R.CLOUDFLARE_RECORD,
+            TP + "test-router-parented-cloudfront-record",
+        )
+        assert_urn(
+            acm_urn,
+            "stelvio:aws:Router",
+            "stelvio:aws:AcmValidatedDomain",
+            "test-router-parented-acm-validated-domain",
+        )
+
+    return pulumi.Output.all(record.pulumi_resource.urn, acm.urn).apply(check)
+
+
+def test_route_ordering_more_specific_paths_first(pulumi_mocks):
+    """Test that more specific paths come first.
+
+    CloudFront uses the first cache behavior whose pattern matches, so /api/v1/*
+    must come before /api/* or it never matches.
+    """
+    bucket1 = Bucket("bucket-api")
+    bucket2 = Bucket("bucket-api-v1")
+    router = Router(name="test-router")
+    # Least specific first, so the Router has to reorder
+    router.route("/api", bucket1)
+    router.route("/api/v1", bucket2)
+
+    @pulumi.runtime.test
+    def deploy():
+        return [bucket1.resources, bucket2.resources, router.resources]
+
+    deploy()
+
+    [distribution] = pulumi_mocks.created(R.DISTRIBUTION)
+    behaviors = distribution.inputs["orderedCacheBehaviors"]
+    assert [b["pathPattern"] for b in behaviors] == ["/api/v1/*", "/api/*"]
+
+
+def test_route_order_preserved_in_routes_list():
+    """Test that routes are stored in the order they are added."""
+    bucket1 = Bucket("bucket1")
+    bucket2 = Bucket("bucket2")
+    bucket3 = Bucket("bucket3")
+
+    router = Router(name="test-router")
+    router.route("/a", bucket1)
+    router.route("/b", bucket2)
+    router.route("/c", bucket3)
+
+    assert router.routes[0].path_pattern == "/a"
+    assert router.routes[1].path_pattern == "/b"
+    assert router.routes[2].path_pattern == "/c"
+
+
+def test_multiple_path_patterns_create_ordered_cache_behaviors(pulumi_mocks):
+    """Test that multiple path patterns result in ordered cache behaviors."""
+    bucket1 = Bucket("static")
+    bucket2 = Bucket("files")
+    bucket3 = Bucket("uploads")
+    router = Router(name="test-router")
+    router.route("/static", bucket1)
+    router.route("/files", bucket2)
+    router.route("/uploads", bucket3)
+
+    @pulumi.runtime.test
+    def deploy():
+        return [bucket1.resources, bucket2.resources, bucket3.resources, router.resources]
+
+    deploy()
+
+    [distribution] = pulumi_mocks.created(R.DISTRIBUTION)
+    assert len(distribution.inputs["origins"]) == 3
+    behaviors = distribution.inputs["orderedCacheBehaviors"]
+    assert sorted(b["pathPattern"] for b in behaviors) == ["/files/*", "/static/*", "/uploads/*"]
+
+
+def test_full_router_with_mixed_origins(
+    pulumi_mocks, mock_get_or_install_dependencies_function, project_cwd
+):
+    """Test Router with multiple different origin types."""
+    bucket = Bucket("static-bucket")
+    fn = Function("api-function", handler="functions/simple.handler")
+    router = Router(name="mixed-router")
+    router.route("/static", bucket)
+    router.route("/api", fn)
+    router.route("/external", "https://httpbin.org/anything")
+
+    @pulumi.runtime.test
+    def deploy():
+        return [bucket.resources, fn.resources, router.resources]
+
+    deploy()
+
+    [distribution] = pulumi_mocks.created(R.DISTRIBUTION)
+    assert len(distribution.inputs["origins"]) == 3
+    # Function and URL routes answer their exact path too; `/static` alone would ask S3 for
+    # the bucket root.
+    assert [b["pathPattern"] for b in distribution.inputs["orderedCacheBehaviors"]] == [
+        "/external",
+        "/external/*",
+        "/static/*",
+        "/api",
+        "/api/*",
+    ]
+    # The URL origin needs no OAC
+    oacs = pulumi_mocks.created(R.ORIGIN_ACCESS_CONTROL)
+    assert {oac.name: oac.inputs["originAccessControlOriginType"] for oac in oacs} == {
+        TP + "mixed-router-static-bucket-oac": "s3",
+        TP + "mixed-router-api-function-oac": "lambda",
+    }
+
+
+def test_router_function_and_url_routes(pulumi_mocks, project_cwd):
+    """A Function route gets an IAM function URL behind an OAC, and CloudFront gets
+    permission to invoke it, unless the route opts out with `auth=None`. The route's
+    `function_url` config and Router's customize keys reach the Function and URL adapters."""
+    customize = {
+        "origin_access_controls": {"description": "custom oac"},
+        "cloudfront_functions": {"comment": "custom function"},
+    }
+
+    @pulumi.runtime.test
+    def deploy():
+        router = Router("my-router", customize=customize)
+        router.route(
+            "/api",
+            Function("api-fn", handler="functions/simple.handler"),
+            function_url={"streaming": True},
+        )
+        router.route(
+            "/open",
+            Function("open-fn", handler="functions/simple.handler"),
+            function_url={"auth": None},
+        )
+        router.route("/ext", "https://example.com")
+        return router.resources
+
+    deploy()
+
+    api_fn = tn(f"{TP}api-fn")
+    pulumi_mocks.assert_res(
+        "api-fn-router-url",
+        R.FUNCTION_URL,
+        {"functionName": api_fn, "invokeMode": "RESPONSE_STREAM", "authorizationType": "AWS_IAM"},
+    )
+    pulumi_mocks.assert_res(
+        "open-fn-router-url",
+        R.FUNCTION_URL,
+        {
+            "functionName": tn(f"{TP}open-fn"),
+            "invokeMode": "BUFFERED",
+            "authorizationType": "NONE",
+        },
+    )
+    pulumi_mocks.assert_res(
+        "my-router-api-fn-oac",
+        R.ORIGIN_ACCESS_CONTROL,
+        {
+            "description": "custom oac",
+            "originAccessControlOriginType": "lambda",
+            "signingProtocol": "sigv4",
+            "signingBehavior": "always",
+        },
+    )
+    pulumi_mocks.assert_res(
+        "my-router-api-fn-perm",
+        R.LAMBDA_PERMISSION,
+        {
+            "action": "lambda:InvokeFunctionUrl",
+            "function": api_fn,
+            "principal": "cloudfront.amazonaws.com",
+            "functionUrlAuthType": "AWS_IAM",
+            "sourceArn": f"arn:aws:cloudfront::123456789012:distribution/{tid(f'{TP}my-router')}",
+        },
+    )
+    dist = pulumi_mocks.assert_res("my-router", R.DISTRIBUTION)
+    origins = {o["originId"]: o for o in dist.inputs["origins"]}
+    assert origins[api_fn]["originAccessControlId"] == tid(f"{TP}my-router-api-fn-oac")
+    assert "originAccessControlId" not in origins[tn(f"{TP}open-fn")]
+    for function in (
+        "my-router-open-fn-rw",
+        "my-router-api-fn-rw",
+        "my-router-url-abe5c496-rw",
+        "my-router-default-404",
+    ):
+        pulumi_mocks.assert_res(
+            function, R.CLOUDFRONT_FUNCTION, {"comment": "custom function"}, partial=True
+        )
+    pulumi_mocks.assert_res_counts(
+        {
+            R.FUNCTION: 3,  # two routed Functions + the URL origin's Lambda@Edge
+            R.ROLE: 3,
+            R.ROLE_POLICY_ATTACHMENT: 3,
+            R.FUNCTION_URL: 2,
+            R.ORIGIN_ACCESS_CONTROL: 1,
+            R.LAMBDA_PERMISSION: 1,
+            R.CLOUDFRONT_FUNCTION: 4,
+            R.DISTRIBUTION: 1,
+        }
+    )
+
+
+def test_router_function_url_aliases_its_earlier_names(pulumi_mocks, project_cwd, monkeypatch):
+    # The mocks never see aliases, so the seam is the FunctionUrl constructor.
+    aliases: dict[str, list[tuple]] = {}
+    original = function_module.FunctionUrl
+
+    def spy(name, *args, opts, **kwargs):
+        aliases[name] = [(a.name, a.parent) for a in opts.aliases if isinstance(a, pulumi.Alias)]
+        return original(name, *args, opts=opts, **kwargs)
+
+    monkeypatch.setattr(function_module, "FunctionUrl", spy)
+
+    @pulumi.runtime.test
+    def deploy():
+        router = Router("my-router")
+        router.route("/api", Function("api-fn", handler="functions/simple.handler"))
+        return router.resources
+
+    deploy()
+
+    old = f"{TP}api-fn-router-0-url"
+    assert aliases[f"{TP}api-fn-router-url"] == [
+        (..., pulumi.ROOT_STACK_RESOURCE),
+        (old, ...),  # under the Router
+        (old, pulumi.ROOT_STACK_RESOURCE),  # stacks last deployed before parenting
+        (f"{TP}{old}", ...),  # the app prefix twice, before that
+        (f"{TP}{old}", pulumi.ROOT_STACK_RESOURCE),
+    ]
+
+
+def test_router_rejects_a_function_url_config_of_the_wrong_type(pulumi_mocks, project_cwd):
+    router = Router("my-router")
+    router.route(
+        "/api", Function("api-fn", handler="functions/simple.handler"), function_url="bad"
+    )
+
+    with raises(
+        TypeError, match=r"^Invalid config type: expected FunctionUrlConfig or dict, got str$"
+    ):
+        _ = router.resources
+
+
+def test_uri_rewrite_function_comment_fits_the_cloudfront_limit(pulumi_mocks):
+    """AWS rejects a CloudFront Function comment over 128 chars."""
+    bucket = Bucket("b")
+    router = Router("r")
+    router.route("/" + "a" * 130, bucket)
+
+    @pulumi.runtime.test
+    def deploy():
+        return [bucket.resources, router.resources]
+
+    deploy()
+
+    fn = pulumi_mocks.assert_res("r-b-rw", R.CLOUDFRONT_FUNCTION)
+    assert len(fn.inputs["comment"]) == 128
+    pulumi_mocks.assert_res_counts(
+        {
+            R.BUCKET: 1,
+            R.BUCKET_PUBLIC_ACCESS_BLOCK: 1,
+            R.BUCKET_POLICY: 1,
+            R.ORIGIN_ACCESS_CONTROL: 1,
+            R.CLOUDFRONT_FUNCTION: 2,  # the prefix strip + the default 404
+            R.DISTRIBUTION: 1,
+        }
+    )
+
+
+def test_per_route_resources_alias_their_route_position_names(
+    pulumi_mocks, project_cwd, monkeypatch
+):
+    """These names carried the route's position, so a stack deployed before the rename keeps
+    every resource through an alias; without one Pulumi replaces the bucket policy, and the
+    delete of the old one leaves the bucket without a policy."""
+    router = Router("router")
+    router.route("/", Bucket("site"))
+    router.route("/fn", Function("fn", handler="functions/simple.handler"))
+    router.route("/ext", "https://example.com")
+    router.route("/api", _rest_api())
+    hapi = HttpApi("hapi")
+    hapi.route("GET", "/", "functions/simple.handler")
+    router.route("/h", hapi)
+
+    # The mocks never see aliases, so the seam is the resource constructor.
+    aliases: dict[str, list[tuple]] = {}
+    original = pulumi.CustomResource.__init__
+
+    def spy(self, t, name, props=None, opts=None, *args, **kwargs):
+        if opts is not None and opts.parent is router:
+            aliases[name] = [
+                (a.name, a.parent) for a in opts.aliases if isinstance(a, pulumi.Alias)
+            ]
+        original(self, t, name, props, opts, *args, **kwargs)
+
+    monkeypatch.setattr(pulumi.CustomResource, "__init__", spy)
+
+    @pulumi.runtime.test
+    def deploy():
+        return router.resources
+
+    deploy()
+
+    def renamed(*old: str) -> list[tuple]:
+        # Each old name under the Router and at the stack root, for stacks last deployed
+        # before parenting; the first alias is every child's, from the Router's own opts.
+        return [(..., pulumi.ROOT_STACK_RESOURCE)] + [
+            alias for name in old for alias in ((name, ...), (name, pulumi.ROOT_STACK_RESOURCE))
+        ]
+
+    # Routes sort longest first, equal lengths as added: /ext 0, /api 1, /fn 2, /h 3, / 4.
+    # The url stem hashes the route path.
+    url = "router-url-abe5c496"
+    assert aliases == {
+        f"{TP}router": renamed(),
+        f"{TP}router-site-oac": renamed(f"{TP}site-oac-4"),
+        f"{TP}site-bucket-policy": renamed(f"{TP}site-bucket-policy-4"),
+        f"{TP}fn-router-url": renamed(f"{TP}fn-router-2-url", f"{TP}{TP}fn-router-2-url"),
+        f"{TP}router-fn-oac": renamed(f"{TP}fn-oac-2"),
+        f"{TP}router-fn-rw": renamed(f"{TP}fn-uri-rewrite-2"),
+        f"{TP}router-fn-perm": renamed(f"{TP}fn-cloudfront-permission-2"),
+        f"{TP}router-api-rw": renamed(f"{TP}api-uri-rewrite-1"),
+        f"{TP}router-hapi-rw": renamed(f"{TP}hapi-uri-rewrite-3"),
+        f"{TP}{url}-rw": renamed(f"{TP}url-origin-uri-rewrite-0"),
+        f"{TP}{url}-r": renamed(f"{TP}url-origin-lambda-edge-role-0"),
+        f"{TP}{url}-p": renamed(f"{TP}url-origin-lambda-edge-policy-0"),
+        f"{TP}{url}-edge": renamed(f"{TP}url-origin-host-rewrite-0"),
+    }
+
+
+def test_bucket_policy_and_function_url_are_named_by_their_component_only(
+    pulumi_mocks, project_cwd
+):
+    """A bucket has one policy and a function one url, so the Router's name stays out of
+    theirs: a Router rename, or the component moving to another Router, then updates them
+    in place. A replace puts the new bucket policy and deletes the old one from the same
+    bucket (403), and AWS refuses a second url on one function."""
+    router = Router("router")
+    router.route("/", Bucket("site"))
+    router.route("/fn", Function("fn", handler="functions/simple.handler"))
+
+    @pulumi.runtime.test
+    def deploy():
+        return router.resources
+
+    deploy()
+
+    pulumi_mocks.assert_res("site-bucket-policy", R.BUCKET_POLICY)
+    pulumi_mocks.assert_res("fn-router-url", R.FUNCTION_URL)
+
+
+def test_two_routers_route_the_same_url(pulumi_mocks):
+    """A url route's resources were named per app, not per router, so two Routers with
+    one url collided on them."""
+
+    @pulumi.runtime.test
+    def deploy():
+        a = Router("a")
+        a.route("/ext", "https://example.com")
+        b = Router("b")
+        b.route("/ext", "https://example.com")
+        return [a.resources, b.resources]
+
+    deploy()
+
+    for router in ("a", "b"):
+        stem = f"{router}-url-abe5c496"
+        pulumi_mocks.assert_res(f"{stem}-edge", R.FUNCTION)
+        pulumi_mocks.assert_res(f"{stem}-r", R.ROLE)
+        pulumi_mocks.assert_res(f"{stem}-p", R.ROLE_POLICY_ATTACHMENT)
+        pulumi_mocks.assert_res(f"{stem}-rw", R.CLOUDFRONT_FUNCTION)
+        [origin] = pulumi_mocks.assert_res(router, R.DISTRIBUTION).inputs["origins"]
+        assert origin["originId"] == f"{TP}{stem}"
+    pulumi_mocks.assert_res_counts(
+        {
+            R.FUNCTION: 2,
+            R.ROLE: 2,
+            R.ROLE_POLICY_ATTACHMENT: 2,
+            R.CLOUDFRONT_FUNCTION: 4,  # two rewrites, two default 404s
+            R.DISTRIBUTION: 2,
+        }
+    )
+
+
+def test_long_router_and_component_names_truncate_the_per_route_names(pulumi_mocks):
+    """The router's name is part of the stem now, so a stem can overflow the 64-char OAC
+    and CloudFront Function caps."""
+    router = Router("a-router-with-a-very-long-name")
+    router.route("/static", Bucket("a-bucket-with-a-very-long-name-too"))
+
+    @pulumi.runtime.test
+    def deploy():
+        return router.resources
+
+    deploy()
+
+    [oac] = pulumi_mocks.created(R.ORIGIN_ACCESS_CONTROL)
+    assert_hash_truncated(oac.name, 56, "-oac")
+    [rewrite] = [f for f in pulumi_mocks.created(R.CLOUDFRONT_FUNCTION) if f.name.endswith("-rw")]
+    assert_hash_truncated(rewrite.name, 56, "-rw")
+    pulumi_mocks.assert_res_counts(
+        {
+            R.BUCKET: 1,
+            R.BUCKET_PUBLIC_ACCESS_BLOCK: 1,
+            R.BUCKET_POLICY: 1,
+            R.ORIGIN_ACCESS_CONTROL: 1,
+            R.CLOUDFRONT_FUNCTION: 2,  # the prefix strip + the default 404
+            R.DISTRIBUTION: 1,
+        }
+    )
+
+
+def test_long_router_name_truncates_the_default_404_function_name(pulumi_mocks):
+    # Over 34 chars (64 cap - 10 prefix - 12 suffix - 8 Pulumi chars) the name needs a hash.
+    router = Router("a-router-with-a-name-longer-than-34-chars")
+    router.route("/static", Bucket("files"))
+
+    @pulumi.runtime.test
+    def deploy():
+        return router.resources
+
+    deploy()
+
+    [not_found] = [
+        f for f in pulumi_mocks.created(R.CLOUDFRONT_FUNCTION) if f.name.endswith("-default-404")
+    ]
+    assert_hash_truncated(not_found.name, 56, "-default-404")
+    pulumi_mocks.assert_res_counts(
+        {
+            R.BUCKET: 1,
+            R.BUCKET_PUBLIC_ACCESS_BLOCK: 1,
+            R.BUCKET_POLICY: 1,
+            R.ORIGIN_ACCESS_CONTROL: 1,
+            R.CLOUDFRONT_FUNCTION: 2,  # /static's prefix strip + the default 404
+            R.DISTRIBUTION: 1,
+        }
+    )
+
+
+def test_long_app_and_env_names_keep_the_full_per_route_names(pulumi_mocks):
+    # Prefix 41 chars: 64 cap - 41 - `-rw` - 8 Pulumi chars leaves 12 for `web-b`. The 404
+    # function's `web` fills the 3 its suffix leaves.
+    app, env = "a" * 29, "production"
+    set_app_and_env_names(app, env)
+    prefix = f"{app}-{env}-"
+    router = Router("web")
+    router.route("/files", Bucket("b"))
+
+    @pulumi.runtime.test
+    def deploy():
+        return router.resources
+
+    deploy()
+
+    pulumi_mocks.assert_res(f"{prefix}web-b-rw", R.CLOUDFRONT_FUNCTION, prefixed=False)
+    pulumi_mocks.assert_res(f"{prefix}web-default-404", R.CLOUDFRONT_FUNCTION, prefixed=False)
+    pulumi_mocks.assert_res(f"{prefix}web-b-oac", R.ORIGIN_ACCESS_CONTROL, prefixed=False)
+    pulumi_mocks.assert_res_counts(
+        {
+            R.BUCKET: 1,
+            R.BUCKET_PUBLIC_ACCESS_BLOCK: 1,
+            R.BUCKET_POLICY: 1,
+            R.ORIGIN_ACCESS_CONTROL: 1,
+            R.CLOUDFRONT_FUNCTION: 2,  # /files's prefix strip + the default 404
+            R.DISTRIBUTION: 1,
+        }
+    )
+
+
+def test_long_app_and_env_names_that_leave_2_chars_raise(pulumi_mocks):
+    # Prefix 42 chars leaves 2 for the default 404 function's name, below the 4-char hash.
+    set_app_and_env_names("a" * 30, "production")
+    router = Router("web")
+    router.route("/files", Bucket("b"))
+
+    @pulumi.runtime.test
+    def deploy():
+        return router.resources
+
+    with raises(
+        ValueError, match=r"'-default-404' .* leave 2 of 64 chars for the name\. Use a shorter app"
+    ):
+        deploy()
+
+
+@mark.usefixtures("mock_get_or_install_dependencies_function", "project_cwd")
+def test_long_router_names_truncate_the_url_and_function_route_names(pulumi_mocks):
+    # Router name over 31 chars overflows the role (64 cap - 10 prefix - `-url-{8 hex}` -
+    # `-r` - 8 Pulumi chars); router and function names over 76 together, the permission
+    # (100 cap).
+    router = Router("a-router-with-a-very-very-long-name")
+    router.route("/ext", "https://example.com")
+    router.route(
+        "/fn",
+        Function(
+            "a-function-with-a-really-very-long-name-too", handler="functions/simple.handler"
+        ),
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return router.resources
+
+    deploy()
+
+    [role] = [r for r in pulumi_mocks.created(R.ROLE) if r.name.startswith(f"{TP}a-router")]
+    assert_hash_truncated(role.name, 56, "-r")
+    [edge] = [f for f in pulumi_mocks.created(R.FUNCTION) if f.name.endswith("-edge")]
+    assert_hash_truncated(edge.name, 56, "-edge")
+    [oac] = pulumi_mocks.created(R.ORIGIN_ACCESS_CONTROL)
+    assert_hash_truncated(oac.name, 56, "-oac")
+    [permission] = [
+        p for p in pulumi_mocks.created(R.LAMBDA_PERMISSION) if p.name.endswith("-perm")
+    ]
+    assert_hash_truncated(permission.name, 92, "-perm")
+    # No AWS name behind it, so the attachment keeps its full logical name.
+    pulumi_mocks.assert_res(
+        "a-router-with-a-very-very-long-name-url-abe5c496-p", R.ROLE_POLICY_ATTACHMENT
+    )
+    pulumi_mocks.assert_res_counts(
+        {
+            R.ROLE: 2,  # the Function's + the Lambda@Edge's
+            R.ROLE_POLICY_ATTACHMENT: 2,
+            R.FUNCTION: 2,  # the Function + the Lambda@Edge
+            R.CLOUDFRONT_FUNCTION: 3,  # two prefix strips + the default 404
+            R.ORIGIN_ACCESS_CONTROL: 1,
+            R.FUNCTION_URL: 1,
+            R.LAMBDA_PERMISSION: 1,
+            R.DISTRIBUTION: 1,
+        }
+    )

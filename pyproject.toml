@@ -1,0 +1,132 @@
+[project]
+name = "stelvio"
+version = "0.10.2b8"
+description = "Ship Python to AWS in minutes, not days"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Stelvio Team", email = "team@stelvio.dev" }, { name = "Michal Martinka", email = "michal@stelvio.dev" }, { name = "Bas Steins", email = "bas@stelvio.dev" }]
+maintainers = [{ name = "Stelvio Team", email = "team@stelvio.dev" }, { name = "Michal Martinka", email = "michal@stelvio.dev" }, { name = "Bas Steins", email = "bas@stelvio.dev" }]
+keywords = ["aws", "cloudflare", "infrastructure"]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Systems Administration",
+]
+
+dependencies = [
+    "uv>=0.13.5",
+    "certifi>=2026.10.19",
+    "pulumi==3.263.0",
+    "pulumi-aws==7.47.0",
+    "pulumi-cloudflare==6.21.0",
+    "click>=8.0,<9",
+    "requests>=2.33,<3",
+    "rich>=14.0,<15",
+    "boto3>=1.0,<2",
+    "websockets>=15.0,<17",
+    "botocore[crt]>=1.42.30",
+    "platformdirs>=4.5.1,<5",
+]
+
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1,<10",
+    "pytest-cov>=7.0,<8",
+    "ruff>=0.14,<1",
+    "mkdocs-material>=9.7.7,<10",
+    "pytest-xdist>=3.8.0",
+    "zensical>=0.0.28",
+    "mkdocstrings-python>=2.0.3",
+]
+
+[project.scripts]
+stlv = "stelvio.cli:main"
+stelvio = "stelvio.cli:main"
+
+[project.urls]
+homepage = "https://stelvio.dev/"
+repository = "https://github.com/stelviodev/stelvio"
+documentation = "https://stelvio.dev/docs/"
+"Bug Tracker" = "https://github.com/stelviodev/stelvio/issues"
+
+[build-system]
+requires = ['hatchling']
+build-backend = 'hatchling.build'
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/stelvio",
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: integration tests that deploy real AWS resources",
+    "integration_vpc: integration tests that create a Vpc (run with --integration-vpc, 4 workers max)",
+    "integration_cf: integration tests with CloudFront distributions (slow teardown)",
+    "integration_dns: integration tests that need a Route 53 domain configured",
+    "integration_macos_privileged: exclusive native macOS tests that can install helpers and mutate host networking",
+    "integration_tunnel: native tests that require deployed AWS tunnel resources",
+]
+# A parametrize list built by a scan (docs pages, components) comes out empty when the scan
+# breaks; pytest's default skips that quietly.
+empty_parameter_set_mark = "fail_at_collect"
+
+[tool.coverage.report]
+omit = ["*/tests/*"]
+
+[tool.uv]
+required-version = ">=0.13.5"
+
+[tool.ruff]
+line-length = 99
+target-version = "py312"
+extend-exclude = ['pulumi-tmpl']
+
+# Configure linting
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "N", "UP", "C4", "A", "S", "ARG", "LOG", "G", "PIE", "T20", "PYI",
+    "PT", "Q", "RSE", "RET", "SLF", "SIM", "SLOT", "TID", "TC", "PTH", "FLY", "C90", "PERF", "W",
+    "PGH", "PL", "FURB", "RUF", "TRY", "INP", "ANN"
+    # "D" - will need, defo need to work on more docs
+]
+ignore = ['TRY003', 'PT013']
+# Allow autofix for all enabled rules (when `--fix` is passed)
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.flake8-annotations]
+mypy-init-return = true
+
+# Sort imports
+[tool.ruff.lint.isort]
+known-first-party = ["stelvio"]
+
+[tool.ruff.lint.per-file-ignores]
+"templates/base/stlv_app.py" = ["INP001", "ARG001"]
+"demo/stlv-demo/stlv_app.py" = ["ARG001"]
+"tests/**/*.py" = [
+    "S101", # asserts allowed in tests
+    "T20", # asserts allowed in tests
+    "SLF", # protected access allowed in tests
+    "TID", # allow relative imports in tests
+    "ARG", # Unused function args -> fixtures nevertheless are functionally relevant
+    "D", # No need to check docstrings in tests
+    "PLR2004",
+    "ANN",
+    "PLC0415", # inline imports needed for test isolation and delayed setup after mocks/env
+]
+"tests/aws/sample_test_project/**/*.py" = ["INP"]
+"tests/integration/handlers/**/*.py" = ["INP", "S"]

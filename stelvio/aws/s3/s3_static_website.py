@@ -1,0 +1,188 @@
+from __future__ import annotations
+
+import mimetypes
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, TypedDict, final
+
+import pulumi
+import pulumi_aws
+
+from stelvio.aws.api_gateway.validators import url_domain, validate_domain_name
+from stelvio.aws.cloudfront import CloudFrontDistribution
+from stelvio.aws.s3.s3 import Bucket, BucketCustomizationDict
+from stelvio.component import Component, resource_name
+from stelvio.provider import ProviderStore
+
+if TYPE_CHECKING:
+    from pulumi_aws.cloudfront import FunctionArgs
+    from pulumi_aws.s3 import BucketObjectArgs
+
+    from stelvio.aws.cloudfront.cloudfront import CloudFrontDistributionCustomizationDict
+    from stelvio.customize import ChildCustomization, Customization
+
+MAX_CF_FUNCTION_NAME_LENGTH = 64
+
+
+@final
+@dataclass(frozen=True)
+class S3StaticWebsiteResources:
+    bucket: Bucket
+    files: list[pulumi_aws.s3.BucketObject]
+    cloudfront_distribution: CloudFrontDistribution
+
+
+class S3StaticWebsiteCustomizationDict(TypedDict, total=False):
+    bucket: ChildCustomization[BucketCustomizationDict]
+    files: Customization[BucketObjectArgs]
+    viewer_request_function: Customization[FunctionArgs]
+    cloudfront_distribution: ChildCustomization[CloudFrontDistributionCustomizationDict]
+
+
+REQUEST_INDEX_HTML_FUNCTION_JS = """
+function handler(event) {
+    var request = event.request;
+    var uri = request.uri;
+    // Check whether the URI is missing a file name.
+    if (uri.endsWith('/')) {
+        request.uri += 'index.html';
+    }
+    // Check whether the URI is missing a file extension.
+    else if (!uri.includes('.')) {
+        request.uri += '/index.html';
+    }
+    return request;
+}
+"""
+
+
+@final
+class S3StaticWebsite(Component[S3StaticWebsiteResources, S3StaticWebsiteCustomizationDict]):
+    def __init__(  # noqa: PLR0913
+        self,
+        name: str,
+        custom_domain: str | None = None,
+        directory: Path | str | None = None,
+        default_cache_ttl: int | None = None,
+        *,
+        tags: dict[str, str] | None = None,
+        customize: S3StaticWebsiteCustomizationDict | None = None,
+    ):
+        super().__init__(
+            ProviderStore.aws(),
+            "stelvio:aws:S3StaticWebsite",
+            name,
+            tags=tags,
+            customize=customize,
+        )
+        self.directory = Path(directory) if isinstance(directory, str) else directory
+        self.custom_domain = custom_domain
+        self.default_cache_ttl = default_cache_ttl
+        # Truthy check: "" keeps meaning "no domain", e.g. `os.getenv("DOMAIN", "")`.
+        if custom_domain:
+            validate_domain_name(custom_domain, field_name="custom_domain", wildcard=True)
+
+    def _create_resources(self) -> S3StaticWebsiteResources:
+        # Validate directory exists
+        if self.directory is not None and not self.directory.exists():
+            raise FileNotFoundError(f"Directory does not exist: {self.directory}")
+
+        bucket = Bucket(
+            f"{self.name}-bucket",
+            tags=self.tags,
+            customize=self._customize.get("bucket"),
+            parent=self,
+        )
+        # Create CloudFront Function to handle directory index rewriting
+        viewer_request_function = pulumi_aws.cloudfront.Function(
+            resource_name(f"{self.name}-viewer-request", limit=MAX_CF_FUNCTION_NAME_LENGTH),
+            **self._customizer(
+                "viewer_request_function",
+                {},
+                default_props={
+                    "runtime": "cloudfront-js-1.0",
+                    "comment": "Rewrite requests to directories to serve index.html",
+                    "code": REQUEST_INDEX_HTML_FUNCTION_JS,
+                },
+            ),
+            opts=self._resource_opts(),
+        )
+        cloudfront_distribution = CloudFrontDistribution(
+            name=f"{self.name}-cloudfront",
+            bucket=bucket,
+            custom_domain=self.custom_domain,
+            function_associations=[
+                {
+                    "event_type": "viewer-request",
+                    "function_arn": viewer_request_function.arn,
+                }
+            ],
+            tags=self.tags,
+            customize=self._customize.get("cloudfront_distribution", {}),
+            parent=self,
+        )
+
+        # Upload files from directory to S3 bucket
+        files = self._process_directory_and_upload_files(bucket, self.directory)
+
+        cf_domain = cloudfront_distribution.resources.distribution.domain_name
+        display_domain = url_domain(self.custom_domain) or cf_domain
+        self.register_outputs({"url": pulumi.Output.concat("https://", display_domain)})
+
+        return S3StaticWebsiteResources(
+            bucket=bucket,
+            files=files,
+            cloudfront_distribution=cloudfront_distribution,
+        )
+
+    def _create_s3_bucket_object(
+        self, bucket: Bucket, directory: Path, file_path: Path
+    ) -> pulumi_aws.s3.BucketObject:
+        key = file_path.relative_to(directory)
+
+        # Convert path separators and special chars to dashes,
+        # ensure valid Pulumi resource name
+        safe_key = re.sub(r"[^a-zA-Z0-9]", "-", str(key))
+        # Remove consecutive dashes and leading/trailing dashes
+        safe_key = re.sub(r"-+", "-", safe_key).strip("-")
+
+        # DO NOT INCLUDE HASH IN RESOURCE NAME
+        # If the resource name changes, Pulumi will treat it as a new resource,
+        # and create a new s3 object
+        # Then, the old one is deleted by pulumi. Sounds correct, but since the
+        # filename (key) is the same, the delete operation deletes the new object!
+        logical_name = f"{self.name}-{safe_key}"
+
+        # For binary files, use source instead of content
+        mimetype, _ = mimetypes.guess_type(file_path.name)
+
+        ttl = self.default_cache_ttl
+
+        return pulumi_aws.s3.BucketObject(
+            resource_name(logical_name, limit=128, suffix="-p"),
+            **self._customizer(
+                "files",
+                {
+                    "key": str(key),
+                    "source": pulumi.FileAsset(file_path),
+                    "content_type": mimetype,
+                    "cache_control": f"public, max-age={ttl}" if ttl is not None else None,
+                },
+                {"bucket": bucket.resources.bucket.id, "cache_control": "public, max-age=120"},
+            ),
+            opts=self._resource_opts(),
+        )
+
+    def _process_directory_and_upload_files(
+        self, bucket: Bucket, directory: Path
+    ) -> list[pulumi_aws.s3.BucketObject]:
+        # glob all files in the directory
+        if directory is None:
+            return []
+
+        return [
+            self._create_s3_bucket_object(bucket, directory, file_path)
+            for file_path in directory.rglob("*")
+            if file_path.is_file()
+        ]

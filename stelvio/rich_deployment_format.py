@@ -1,0 +1,267 @@
+"""Pure format functions for deployment progress display.
+
+These functions take data in and return Rich Text objects. They have no
+state dependencies and are used by RichDeploymentHandler for rendering.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from pulumi.automation import OpType
+from rich.text import Text
+
+from stelvio.rich_deployment_model import ComponentInfo, ResourceInfo, resource_label
+
+
+def get_operation_display(
+    operation: OpType | None, status: str, is_preview: bool
+) -> tuple[str, str]:
+    """Get the glyph and color for an operation display."""
+
+    if operation == OpType.SAME:
+        return "~ ", "dim"
+
+    if is_preview:
+        display_map = {
+            OpType.CREATE: ("+ ", "green"),
+            OpType.UPDATE: ("~ ", "yellow"),
+            OpType.DELETE: ("- ", "red"),
+            OpType.DISCARD: ("- ", "red"),
+            OpType.REPLACE: ("± ", "blue"),
+            OpType.CREATE_REPLACEMENT: ("± ", "blue"),
+            OpType.DELETE_REPLACED: ("± ", "blue"),
+            OpType.REFRESH: ("~ ", "sea_green3"),
+            OpType.READ: ("~ ", "sea_green3"),
+        }
+    elif status == "active":
+        display_map = {
+            OpType.CREATE: ("| ", "green"),
+            OpType.UPDATE: ("| ", "yellow"),
+            OpType.DELETE: ("| ", "red"),
+            OpType.DISCARD: ("| ", "red"),
+            OpType.REPLACE: ("| ", "blue"),
+            OpType.CREATE_REPLACEMENT: ("| ", "blue"),
+            OpType.DELETE_REPLACED: ("| ", "blue"),
+            OpType.REFRESH: ("| ", "sea_green3"),
+            OpType.READ: ("| ", "sea_green3"),
+        }
+    else:  # completed
+        display_map = {
+            OpType.CREATE: ("✓ ", "green"),
+            OpType.UPDATE: ("✓ ", "yellow"),
+            OpType.DELETE: ("✓ ", "red"),
+            OpType.DISCARD: ("✓ ", "red"),
+            OpType.REPLACE: ("✓ ", "blue"),
+            OpType.CREATE_REPLACEMENT: ("✓ ", "blue"),
+            OpType.DELETE_REPLACED: ("✓ ", "blue"),
+            OpType.REFRESH: ("✓ ", "sea_green3"),
+            OpType.READ: ("✓ ", "sea_green3"),
+        }
+
+    return display_map.get(operation, ("| ", "yellow"))
+
+
+def _calculate_duration(resource: ResourceInfo) -> str:
+    if not resource.start_time:
+        return ""
+
+    end_time = resource.end_time or datetime.now().timestamp()
+    return f"({end_time - resource.start_time:.1f}s)"
+
+
+def _calculate_component_duration(component: ComponentInfo) -> str:
+    """Calculate duration string for a component."""
+    if not component.start_time:
+        return ""
+    end = component.end_time
+    if end is None:
+        end = datetime.now().timestamp()
+    return f"({end - component.start_time:.1f}s)"
+
+
+def format_component_header(
+    component: ComponentInfo,
+    is_preview: bool,
+    duration_str: str = "",
+    resource_word_in_preview: bool = False,
+    name: str | None = None,
+) -> Text:
+    """Format a component header line.
+
+    Live/completed: ✓ Function  api-handler  (2.1s)
+    Preview: + Function  api-handler  (4 to create)
+
+    `name` overrides the shown name only: a nested component drops its parent's prefix on
+    screen while `component.name` stays whole for the JSON stream and error matching.
+    """
+    if component.status == "failed":
+        prefix, color = "✗ ", "red"
+    else:
+        prefix, color = get_operation_display(component.operation, component.status, is_preview)
+
+    line = Text()
+    line.append(prefix, style=color)
+    line.append(component.component_type, style="bold")
+    line.append(f" {name or component.name}")
+
+    if is_preview:
+        summary = component.preview_summary(include_resource_word=resource_word_in_preview)
+        if summary:
+            line.append(f"  ({summary})", style="dim")
+    elif duration_str:
+        line.append(f"  {duration_str}", style="dim")
+
+    return line
+
+
+def format_child_resource_line(
+    resource: ResourceInfo,
+    is_preview: bool,
+    duration_str: str = "",
+    indent: int = 1,
+    suffix: str = "",
+) -> Text:
+    """Format a child resource line (indented under component).
+
+    Shows: `    ✓ Lambda Function (0.8s)`. `suffix` tells same-type siblings apart:
+    `    ✓ Subnet (public-subnet-a)`.
+    """
+    if resource.status == "failed":
+        prefix, color = "✗ ", "red"
+    else:
+        prefix, color = get_operation_display(resource.operation, resource.status, is_preview)
+
+    line = Text()
+    line.append("    " * indent)
+    line.append(prefix, style=color)
+    line.append(resource_label(resource))
+    if suffix:
+        line.append(f" ({suffix})", style="dim")
+
+    if resource.change_summary:
+        line.append(f" ({resource.change_summary})", style="dim")
+
+    if duration_str:
+        line.append(f" {duration_str}", style="dim")
+
+    return line
+
+
+# AWS tells RDS/DocumentDB users to add a subnet in a listed zone. Stelvio already
+# chose the Vpc's zones, and the cluster's zone list is fixed once it exists.
+_INSTANCE_CLASS_CAPACITY_PHRASE = "create at least one new subnet"
+_INSTANCE_CLASS_CAPACITY_HINT = (
+    "AWS has no capacity for this instance class in your Vpc's availability zones right now.",
+    "Set a different `instance` and deploy again, or try later.",
+    "Docs: https://stelvio.dev/docs/components/aws/document-db/#instance-class-capacity",
+)
+
+
+def format_child_error_line(error: str, indent: int = 1) -> Text:
+    """Format an error message indented under a child resource.
+
+    A capacity failure keeps AWS's text and adds the fix under it: another
+    instance class, or try later.
+    """
+    line = Text()
+    pad = "    " * (indent + 1)
+    line.append(pad)
+    line.append(error, style="red")
+    if _INSTANCE_CLASS_CAPACITY_PHRASE in error.lower():
+        for hint in _INSTANCE_CLASS_CAPACITY_HINT:
+            line.append("\n")
+            line.append(pad)
+            line.append(hint, style="yellow")
+    return line
+
+
+def build_operation_counts_text(
+    total_resources: int, component_count: int, summary_verb: str, failed_resources: int = 0
+) -> Text | None:
+    """Build the operation counts summary text.
+
+    With components: "  3 components (7 resources) deployed"
+    No components:   "  7 resources deployed"
+    With failures:   "  3 components (6 resources) deployed, 1 failed"
+    """
+    if total_resources == 0:
+        return None
+
+    done = total_resources - failed_resources
+    resource_word = "resource" if done == 1 else "resources"
+    final_text = Text("  ")  # Indent
+
+    if component_count > 0:
+        component_word = "component" if component_count == 1 else "components"
+        final_text.append(str(component_count), style="bold")
+        final_text.append(f" {component_word} ({done} {resource_word}) {summary_verb}")
+    else:
+        final_text.append(f"{done} {resource_word} {summary_verb}")
+
+    if failed_resources > 0:
+        final_text.append(f", {failed_resources} failed", style="red")
+
+    return final_text
+
+
+def build_preview_counts_text(
+    resources: dict[str, ResourceInfo], *, component_count: int = 0
+) -> Text | None:
+    """Build preview summary: '  3 components: 4 to create, 1 to update'."""
+    counts: dict[str, int] = {}
+    # No _REPLACE_OPS entries: has_replacement is already True for those operations
+    # (ResourceInfo.has_replacement), so the check below labels them.
+    op_labels = {
+        OpType.CREATE: "to create",
+        OpType.UPDATE: "to update",
+        OpType.DELETE: "to delete",
+    }
+    op_colors = {
+        "to create": "green",
+        "to update": "yellow",
+        "to delete": "red",
+        "to replace": "blue",
+    }
+
+    for r in resources.values():
+        if r.operation in (None, OpType.SAME):  # None failed Check; its error line says so
+            continue
+        label = "to replace" if r.has_replacement else op_labels.get(r.operation, "to change")
+        counts[label] = counts.get(label, 0) + 1
+
+    if not counts:
+        return None
+
+    text = Text("  ")
+    if component_count > 0:
+        component_word = "component" if component_count == 1 else "components"
+        text.append(f"{component_count} {component_word}: ")
+
+    # Order: create, update, replace, delete
+    order = ["to create", "to update", "to replace", "to delete", "to change"]
+    first = True
+    for label in order:
+        if label in counts:
+            if not first:
+                text.append(", ")
+            color = op_colors.get(label, "white")
+            text.append(str(counts[label]), style=color)
+            # The counts are resources, the prefix is components — name the noun once, on
+            # the first label, so "1 component: 20 to create" can't read as 20 components.
+            noun = f"{'resource' if counts[label] == 1 else 'resources'} " if first else ""
+            text.append(f" {noun}{label}", style=color)
+            first = False
+    return text
+
+
+def short_name(name: str, ancestors: tuple[str, ...]) -> str:
+    """`api-get-users` under RestApi `api` -> `get-users`, the strip the deploy tree's
+    `_child_suffix` gives resources. Nearest ancestor first: `Topic.subscribe` names the
+    Function after the topic, not the subscription, so `orders-notify` under
+    `orders-notify-subscription` under `orders` -> `notify`. Render-only: the full name feeds
+    the JSON stream and error matching."""
+    for ancestor in ancestors:
+        if name.startswith(f"{ancestor}-"):
+            return name.removeprefix(f"{ancestor}-")
+    return name

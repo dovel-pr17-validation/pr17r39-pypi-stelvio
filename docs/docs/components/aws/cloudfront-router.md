@@ -1,0 +1,303 @@
+# AWS CloudFront (CDN)
+
+This guide explains how to expose different Stelvio components to the web using a CloudFront Router.
+
+AWS CloudFront is primarily a CDN (Content Delivery Network). That means the CloudFront service can globally cache resources (called origins), typically static resources like S3 buckets.
+
+Because CloudFront allows executing small functions to manipulate request objects before they hit the origin, we can use CloudFront as a routing component: We can map components to paths and disable caching for dynamic origins like APIs.
+
+## Router
+
+Let's assume, our web app consists of two components:
+- An **S3 Bucket** that contains publicly accessible files
+- An **API Gateway** that contains our application logic
+
+We want to access our components with the following paths:
+- `/api/*` -> should hit the API Gateway
+- `/files` -> should hit the S3 bucket
+
+The way to configure this in Stelvio looks like this:
+
+```python
+@app.run
+def run() -> None:
+    domain_name = "example.com"
+
+    bucket = Bucket("static-files-bucket")
+
+    api = RestApi("my-api")
+    api.route("GET", "/", "functions/hello.handler")
+
+    router = Router("rtr-test", custom_domain=domain_name)
+    router.route("/files", bucket)
+    router.route("/api", api)
+```
+
+The crucial part here is the line `router = Router("rtr-test", custom_domain=...)`.
+This creates a CloudFront Router component.
+
+With this component, you can add routes to your existing components as such:
+```python
+router.route("/files", bucket)
+router.route("/api", api)
+```
+
+You might wonder why there is another route definition in API Gateway:
+
+```python
+api.route("GET", "/", "functions/hello.handler")
+```
+
+The reason for this is that the CloudFront Router sits just in front of all other components from a visitor's perspective.
+Your API handles all its internal routes by itself, as outlined in the [REST API guide](rest-api.md) and [HTTP API guide](http-api.md).
+
+The CloudFront route (`router.route("/api", api)`) maps every incoming request to the API and strips the `/api` prefix. A request to `/api` therefore reaches the API's `/` route, while `/api/users` reaches `/users`. The same behavior applies to both `RestApi` and `HttpApi` origins. Each such route takes two of the 75 cache behaviors a CloudFront distribution allows, one for `/api` and one for `/api/*`.
+
+Similarly, the S3 Bucket has its internal structure of objects. Let's say, you have an object called "hello.txt" in your bucket. If you'd expose the bucket to the web as outlined in the [Custom Domains](../../concepts/dns.md), you'd access that file via `https://example.com/hello.txt`. However, that's not what our intention was initially: We want to access that file via `https://example.com/files/hello.txt`. This is what the CloudFront route is for: It takes the incoming request, strips the `files/` part and directs it to the bucket origin.
+
+#### Route ordering and path matching
+
+CloudFront matches routes based on the order of precedence in the distribution configuration. To make this behavior intuitive, **Stelvio automatically sorts your routes by path specificity**. This means more specific paths always take precedence over less specific ones, regardless of the order you define them in your code.
+
+For example:
+
+```python
+router = Router("MyRouter")
+router.route("/api", api)           # Less specific
+router.route("/api/admin", admin)   # More specific
+```
+
+In this case, requests to `/api/admin/users` will hit the `admin` origin, while `/api/users` will hit the `api` origin—regardless of which route was added first.
+
+!!! note "Path matching rules"
+    - A path starts with `/`, has no trailing `/`, no empty, `.` or `..` segment, no `?` and no `**`. Other characters: letters, digits and `_ . ~ - $ @ : + *`. CloudFront caps a path pattern at 255 characters, and a plain path also gets a `/*` pattern, so it may have 253. The Router rejects any other path
+    - A route that an earlier route always catches (`/api` next to `/api*`) is rejected
+    - Longer, more specific paths take priority over shorter ones
+    - The root path `/` acts as a catch-all for unmatched requests. `/*` is the same route, so a Router accepts only one of them
+    - If no root path is defined, unmatched requests return a 404 response
+    - A path with a `*` (`/files/*`, `/images/*.jpg`) keeps its prefix: `/files/a.txt` reaches the origin as `/files/a.txt`. CloudFront's `*` also matches `/`, so `/images/*.jpg` matches `/images/a/b.jpg`. The length sort counts each `*`, so `/*.jpg` comes before `/api` and takes `/api/logo.jpg`
+    - A Bucket on the root path serves its `index.html` for `/` only. A folder in it (`/docs/`) or a bucket route on another path (`/files/`) returns 403
+
+!!! warning "Routes must be defined before resource creation"
+    All routes must be added to the Router before its resources are created. Once the Router's CloudFront distribution and related resources have been provisioned, attempting to add new routes will raise a `RuntimeError`. Define all your routes immediately after creating the Router instance.
+
+#### Lambda Function URL Configuration
+
+A standalone Lambda function (as outlined in the [Lambda](../aws/lambda.md)) can have a Function URL config attached.
+
+If you want to handle a Lambda function with this router, Stelvio defaults to using IAM authentication (`auth="iam"`). This ensures that your Lambda function is not directly accessible from the public internet, but only through the CloudFront Router (which signs requests).
+
+You can explicitly set `auth=None` if you want the Lambda function to remain publicly accessible directly via its Function URL, but the recommended pattern is to restrict access to the Router.
+
+Here is how it works:
+
+```python
+# Create the Lambda function
+fn = Function("MyFunction", handler="functions/api.handler")
+
+# Create the router
+router = Router("MyRouter")
+
+# Override CORS (auth defaults to "iam")
+router.route("/api", fn, function_url={"cors": {...}})
+```
+
+Key takeaway: When `auth` is omitted or set to `"default"`, `Router` defaults to `"iam"`.
+
+With `"iam"`, CloudFront signs every request it sends to the function. This changes two things for your clients:
+
+- A `PUT` or `POST` with a body must carry the body's SHA-256 hex digest in an `x-amz-content-sha256` header. Lambda doesn't accept unsigned payloads, so without it the request fails. See [Restrict access to an AWS Lambda function URL origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-lambda.html).
+- Your function never sees the client's `Authorization` header, because CloudFront replaces it with its own signature. Send your own tokens in a different header.
+
+```bash
+BODY='{"key": "value"}'
+curl -X POST https://example.com/api \
+  -H "Content-Type: application/json" \
+  -H "x-amz-content-sha256: $(printf '%s' "$BODY" | shasum -a 256 | cut -d' ' -f1)" \
+  -d "$BODY"
+```
+
+`function_url={"auth": None}` drops the `x-amz-content-sha256` rule, but then anyone can call the Function URL directly, past the Router.
+
+
+#### API and Function routes cache behavior
+
+CloudFront doesn't cache API and Function routes and doesn't compress their responses. It passes every viewer header except `Host`, all cookies and all query strings to the origin. On a Function route with IAM auth, CloudFront replaces `Authorization` with its own signature, as described above.
+
+#### S3 Buckets cache behavior
+
+When routing a path to an S3 bucket, the default cache values are set like this:
+
+```python
+default_ttl = 86400 # 1 day
+max_ttl: 31536000 # 1 year
+```
+
+This is a sane default to take advantage of the reduced traffic costs in CloudFront (compared to S3).
+If you need to invalidate the cache, you can use the `aws` CLI:
+
+```bash
+# Find your distribution ID via: aws cloudfront list-distributions
+
+# Invalidate all cached content
+aws cloudfront create-invalidation \
+  --distribution-id E1234567890ABC \
+  --paths "/*"
+
+# Invalidate specific paths
+aws cloudfront create-invalidation \
+  --distribution-id E1234567890ABC \
+  --paths "/index.html" "/assets/*"
+```
+
+!!! note "Costs associated with cache invalidation"
+    - First 1,000 invalidation paths/month are free
+    - `/*` counts as 1 path (invalidates everything)
+
+!!! note "When to invalidate cache"
+    If your S3 objects use stable (non-versioned) names (no hash, timestamp, or random suffix),
+    you must invalidate the affected paths (or `/*`) after updating them; otherwise CloudFront
+    may continue serving stale cached content until the TTL expires.
+
+
+Future versions of Stelvio will allow customizing the cache time values.
+
+### Forwarding to external URLs
+
+You can add an external URL (instead of a component) as a origin target for the `Router` like so:
+
+```python
+router.route("/echo", "https://example.com")
+```
+
+This means that all requests to `/echo` on the `Router`'s domain will be proxied to `https://example.com`.
+
+**Note**: The `Host` header is rewritten, so that every request to this external URL is sent with the `Host` header of the origin domain (`example.com` in the example).
+
+### Upgrading an existing Router
+
+Deploy 0.11 once with your routes unchanged. The Router's per-route resources move to new names in state, and nothing is replaced.
+
+If a route must change in that deploy (a path 0.11 rejects, or `routes=` turned into `route()` calls), other routes' resources can be replaced once, as in 0.10:
+
+- A bucket route answers 403. Run `stlv refresh`, then deploy.
+- A Function route's deploy fails, because AWS allows one URL per function. Delete the function's URL in the Lambda console, then deploy.
+- A URL route's deploy ends with an error deleting its old Lambda@Edge function: CloudFront removes the function's replicas first, which can take a few hours. Deploy again later.
+
+A bucket route already at 403 from an earlier deploy needs the same `stlv refresh` and deploy.
+
+## Why you need it
+
+If you want to expose multiple AWS resources on the same domain, Stelvio's CloudFront Router is the way to go.
+
+Let's say you have an SPA (Single Page Application) with static resources and an API Gateway as a backend. You might want to expose them on the **same domain** to avoid dealing with complex CORS (Cross-Origin Resource Sharing) settings.
+
+## Supported Origins
+
+As of now, Stelvio supports the following components as origins for the CloudFront Router:
+
+- S3 Bucket
+- API Gateway REST APIs (`RestApi`)
+- API Gateway HTTP APIs (`HttpApi`)
+- Lambda Function (using Lambda Function URLs)
+- External URLs
+
+!!! warning "Each origin can only be used once"
+    Each component or URL can only be routed to a single path. You cannot add multiple routes pointing to the same origin. If you need to serve the same component under different paths, consider restructuring your application or using path patterns within your component.
+
+## Use with custom domains
+
+If you're using the `custom_domain` argument for the `Router` component, keep in mind that this might conflict with existing custom domain settings on the origin components.
+
+For example, if you have set a custom domain on your API Gateway like in the following example, the same custom domain must not be used for the `Router` component:
+
+```python
+api = RestApi("MyApi", domain_name="example.com")
+api.route("GET", "/", "functions/api.handler")
+
+router = Router("MyRouter", custom_domain="example.com")
+router.route("/api", api)
+```
+
+It is however possible to use different sub-domains on components used by the `Router` like so:
+
+```python
+api = RestApi("MyApi", domain_name="api.example.com")
+api.route("GET", "/", "functions/api.handler")
+
+router = Router("MyRouter", custom_domain="example.com")
+router.route("/api", api)
+```
+
+
+### Parameters
+
+| Parameter       | Description                                                                                                                                            |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `custom_domain` | The custom domain name for router endpoint. If provided, a DNS record will be created for the CloudFront router. Optional. A `str`. |
+
+## Customization
+
+The `Router` component supports the `customize` parameter to override underlying Pulumi resource properties. For an overview of how customization works, see the [Customization guide](../../concepts/customization.md).
+
+### Resource Keys
+
+| Resource Key            | Pulumi Args Type                                                                                                            | Description                              |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------------------|------------------------------------------|
+| `distribution`          | [DistributionArgs](https://www.pulumi.com/registry/packages/aws/api-docs/cloudfront/distribution/#inputs)                   | The CloudFront distribution              |
+| `origin_access_controls`| [OriginAccessControlArgs](https://www.pulumi.com/registry/packages/aws/api-docs/cloudfront/originaccesscontrol/#inputs)     | OAC for each origin                      |
+| `access_policies`       | [BucketPolicyArgs](https://www.pulumi.com/registry/packages/aws/api-docs/s3/bucketpolicy/#inputs)                           | Bucket policies for S3 origins           |
+| `cloudfront_functions`  | [FunctionArgs](https://www.pulumi.com/registry/packages/aws/api-docs/cloudfront/function/#inputs)                           | CloudFront functions (e.g., 404 handler) |
+| `acm_validated_domain`  | Nested (see [ACM customization](../../concepts/dns.md))                                                                     | ACM certificate resources                |
+| `record`                | Depends on DNS provider (e.g., Cloudflare, Route53)                                                                         | DNS record (when custom domain set)      |
+
+### Example
+
+```python
+from stelvio.aws.cloudfront.router import Router
+
+router = Router(
+    "my-router",
+    custom_domain="app.example.com",
+    customize={
+        "distribution": {
+            "price_class": "PriceClass_200",
+        }
+    }
+)
+```
+
+### CloudFrontDistribution
+
+The `CloudFrontDistribution` component supports the `customize` parameter to override underlying Pulumi resource properties.
+
+#### Resource Keys
+
+| Resource Key            | Pulumi Args Type                                                                                                        | Description                              |
+|-------------------------|------------------------------------------------------------------------------------------------------------------------|------------------------------------------|
+| `distribution`          | [DistributionArgs](https://www.pulumi.com/registry/packages/aws/api-docs/cloudfront/distribution/#inputs)               | The CloudFront distribution              |
+| `cache_policy`          | [CachePolicyArgs](https://www.pulumi.com/registry/packages/aws/api-docs/cloudfront/cachepolicy/#inputs)                 | Cache policy for the distribution        |
+| `origin_access_control` | [OriginAccessControlArgs](https://www.pulumi.com/registry/packages/aws/api-docs/cloudfront/originaccesscontrol/#inputs) | OAC for secure S3 access                 |
+| `acm_validated_domain`  | Nested (see [ACM customization](../../concepts/dns.md))                                                                                | ACM certificate resources                |
+| `record`                | Depends on DNS provider (e.g., Cloudflare, Route53)                                                                     | DNS record (when custom domain set)      |
+| `bucket_policy`         | [BucketPolicyArgs](https://www.pulumi.com/registry/packages/aws/api-docs/s3/bucketpolicy/#inputs)                       | S3 bucket policy for CloudFront access   |
+
+#### Example
+
+```python
+from stelvio.aws.cloudfront import CloudFrontDistribution
+
+cdn = CloudFrontDistribution(
+    "my-cdn",
+    bucket=my_bucket,
+    customize={
+        "distribution": {
+            "price_class": "PriceClass_All",
+            "tags": {"CDN": "production"},
+        },
+        "cache_policy": {
+            "comment": "Custom cache policy",
+        }
+    }
+)
+```

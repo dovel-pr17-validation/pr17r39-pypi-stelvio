@@ -1,0 +1,288 @@
+# Writing integration tests
+
+Integration tests deploy real AWS resources, assert against them with boto3, then destroy
+them. They need an AWS profile and take minutes. Unit tests prove we asked AWS for what we
+intended; these prove AWS accepted it and the thing works — see
+[Writing unit tests](unit-tests.md).
+
+They're the release gate: every component has them, add them for what you add. CI runs them on
+manual dispatch only (`.github/workflows/integration-tests.yml`, Python 3.12–3.14), so nothing
+runs them on your PR. Run them yourself if you have an account; say so in the PR if you can't.
+
+Read `tests/integration/test_queue.py` and `test_scenario_events.py` next to this page.
+
+## The shape
+
+```python
+pytestmark = pytest.mark.integration
+
+
+def test_queue_subscribe(stelvio_env, project_dir):
+    def infra():
+        queue = Queue("tasks")
+        sub = queue.subscribe("processor", "handlers/echo.main", batch_size=5)
+        export_queue(queue)
+        export_function(sub.resources.function)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_event_source_mapping(
+        outputs["function_tasks-processor_arn"],
+        event_source_arn=outputs["queue_tasks_arn"],
+        batch_size=5,
+    )
+```
+
+`stelvio_env` deploys `infra()` into its own stack and destroys it on teardown. Nothing is
+exported automatically: call the `export_*` helper from `export_helpers.py` for every resource
+you assert on, that dict is your only handle on what AWS created. Keys are
+`{component}_{name}_{field}`; check `export_helpers.py` for the exact key. `project_dir` is a
+temp project with `handlers/` copied in — needed whenever the test deploys a Function.
+
+## Asserting
+
+Assert helpers read the resource back with boto3 and take keyword-only params they check only
+when you pass them — extend an existing helper instead of writing a one-off. Most live in
+`assert_helpers.py`; that file is too big and being split, so helpers for a new component go
+in their own module like `assert_vpc.py`. Get clients from `_boto3_session()`, never build a
+session inline.
+
+A green deploy proves nothing about behavior. Invoke what you can: `invoke_lambda` for a
+Function, `http_request` for an API — that's how bundling bugs surface.
+
+Never substring-assert. Parse the structure and compare exact values:
+
+```python
+# BAD — passes on the wrong field
+assert "process-123" in json.dumps(event)
+
+# GOOD
+sqs_body = json.loads(event["Records"][0]["body"])
+assert sqs_body["task"] == "process-123"
+```
+
+## Scenario tests
+
+Property tests read configuration back. Scenario tests prove the wiring fires: deploy the
+source plus a subscriber and a results table, trigger, poll, assert the parsed event.
+
+```python
+def test_scenario_queue_triggers_lambda(stelvio_env, project_dir):
+    def infra():
+        results = DynamoTable("results", fields={"pk": "S"}, partition_key="pk")
+        queue = Queue("jobs")
+        queue.subscribe("worker", "handlers/event_recorder.main", links=[results])
+        export_dynamo_table(results)
+        export_queue(queue)
+
+    outputs = stelvio_env.deploy(infra)
+
+    send_sqs_message(outputs["queue_jobs_url"], {"task": "process-123"})
+
+    items = poll_dynamo_items(outputs["dynamotable_results_name"])
+    assert len(items) >= 1
+    event = json.loads(items[0]["event"])
+    sqs_body = json.loads(event["Records"][0]["body"])
+    assert sqs_body["task"] == "process-123"
+```
+
+Triggers: `send_sqs_message`, `publish_sns_message`, `upload_s3_object`, `put_dynamo_item`,
+`invoke_lambda`, `http_request`. Waits: `poll_dynamo_items`, `poll_sqs_messages`, `drain_sqs`,
+`wait_for_event_source_mapping`. Handlers are pre-built in `handlers/` (`echo`,
+`event_recorder`, `api_crud`, `invoker`, `queue_sender`, `auth`) — they reference link names
+like `Resources.results`, so the component name in your test has to match.
+
+## Tiers
+
+| Tier | Marker | Flag | Needs |
+|---|---|---|---|
+| Standard | `integration` | `--integration` | AWS profile |
+| VPC | `integration_vpc` | `--integration-vpc` | AWS profile (4 workers max; account VPC quota is 10 including the default VPC) |
+| CloudFront | `integration_cf` | `--integration-cf` | AWS profile |
+| DNS | `integration_dns` | `--integration-dns` | + `STLV_TEST_DNS_DOMAIN`, `STLV_TEST_DNS_ZONE_ID` (optional `STLV_TEST_ACM_CERTIFICATE_ARN` for a pre-issued `*.domain` cert). One `*.domain` cert plus its validation record stay in the account for reuse (`stelvio:env=test` only, no `stelvio:app`, so cleanup skips them). |
+| Native macOS | `integration_macos_privileged` | `--integration-macos-privileged` | macOS 15+, ordinary user, exclusive host lane, `-n 0`; may install or replace the helper and changes routes and resolver files during tests. |
+
+CloudFront distributions take 3–5 minutes to delete, so they get their own tier; their property
+tests skip edge propagation with `customize=NO_WAIT_DEPLOY`. DNS tests skip themselves when the
+env vars are missing. `run_all.sh` is the single source of truth for test/worker counts —
+they're picked so tests divide evenly with no straggler; update them there when you add tests.
+
+The VPC tier holds every test that constructs a `Vpc` (VPC tests, VPC Function tests, and
+DocumentDB). The `integration_vpc` marker takes precedence over the standard `integration`
+marker, so `--integration` skips VPC tests and `--integration-vpc` selects them. Do not put
+VPC creates back in the standard tier: the account allows 10 VPCs per region and already has
+a default VPC.
+
+## Running them
+
+```bash
+# all tiers in parallel (DNS tier only if the domain vars are set)
+STLV_TEST_AWS_PROFILE=<profile> ./tests/integration/run_all.sh
+
+# one tier — take -n from the matching line in run_all.sh
+STLV_TEST_AWS_PROFILE=<profile> uv run pytest tests/integration/ --integration -v -n <N>
+STLV_TEST_AWS_PROFILE=<profile> uv run pytest tests/integration/ --integration-vpc -v -n 4
+
+# filter
+STLV_TEST_AWS_PROFILE=<profile> uv run pytest tests/integration/ --integration -k dynamo
+```
+
+Never combine tier flags in one pytest run: it opens too many files and the run collapses.
+Don't interrupt after `[100%]` — teardown is still destroying stacks. Wait for the summary
+line.
+
+The native macOS lane is separate from `run_all.sh`. The runner never passes
+`--integration-macos-privileged`. Run this lane only when you have authorization to
+change the host and can restore its existing helper and networking state:
+
+```bash
+uv run pytest tests/integration/test_tunnel_host.py tests/integration/test_tunnel_dns.py \
+  --integration-macos-privileged -n 0 -q
+```
+
+The lane records the existing helper and host baseline before it runs. It restores
+the original helper and compares interfaces, routes, scoped resolvers, DNS state,
+and networking processes during teardown. Stop if the preflight finds an active
+session, foreign state, or an unfinished administration transaction. Do not run
+this lane with another integration tier or with xdist workers.
+
+A killed run leaves stacks and resources behind:
+
+```bash
+STLV_TEST_AWS_PROFILE=<profile> uv run python tests/integration/cleanup.py --tags --names
+```
+
+Default is state files in the temp dir; `--tags` scans by `stelvio:env=test`, `--names` by the
+`stlv-<hex>-test-` prefix, `--dry-run` shows without deleting, `--region` repeats for
+cross-region runs.
+
+## Traforo build and distribution acceptance
+
+Traforo build checks are separate from AWS and host-mutating integration tiers.
+Run the build-only target on macOS with the pinned Go and GoReleaser tools:
+
+```bash
+make -C pkg/traforo-client-go build
+```
+
+It validates both Darwin images and writes provenance without helper installation
+or release publication. The builder prints the host image path for explicit local
+selection. The default builder command can install that image through the existing
+administrator transaction; do not use it in CI or artifact validation.
+
+Build Python archives before running distribution acceptance. Pytest inspects the
+archives and installs the wheel outside the checkout; it does not build artifacts:
+
+```bash
+DIST_DIR="$(mktemp -d)"
+uv build --out-dir "${DIST_DIR}"
+STLV_TEST_STELVIO_WHEEL="$(find "${DIST_DIR}" -name '*.whl' -print -quit)" \
+STLV_TEST_STELVIO_SDIST="$(find "${DIST_DIR}" -name '*.tar.gz' -print -quit)" \
+  uv run pytest tests/tunnel/test_distribution_acceptance.py -q
+```
+
+The tests reject Go source, developer scripts, native images, and the Session
+Manager plugin in both Python archives. They also verify that isolated imports
+come from the installed wheel.
+
+## Cost and isolation
+
+Each test deploys into its own stack (`integ-<test-name>`) under an app named `stlv-<6 hex>`,
+so parallel runs and reruns never collide. Teardown destroys it, retries once after a refresh,
+and prints the state dir if it still fails. The resources are real: Lambda, DynamoDB, SQS and
+SNS stay near free tier, CloudFront and NAT gateways don't.
+
+## Gotchas
+
+- DynamoDB Streams: after `wait_for_event_source_mapping()` the mapping still has to discover
+  shards. Write items in a loop until one lands; write-once-then-poll times out.
+- S3 notifications: AWS sends `s3:TestEvent` when the config is created. Sleep, `drain_sqs()`,
+  then trigger.
+- A bucket that receives objects needs `customize=FORCE_DESTROY_BUCKET`, otherwise destroy
+  fails on a non-empty bucket.
+- Sleeps are named module constants with a comment explaining the number.
+
+### Helper control ownership
+
+An active helper accepts control requests only from the process that owns its lease.
+A different process must not inspect the active lease directly. The helper can
+reject a connection before it reads the request. The client preserves a valid
+rejection reply as a typed error. A missing or invalid reply does not imply that
+the helper is busy. Failed requests are not replayed.
+
+Run the owner-rejection lifecycle regression with the privileged tier enabled:
+
+```bash
+uv run pytest tests/integration/test_tunnel_host.py -k owner_lifecycle \
+  --integration-macos-privileged -n 0
+```
+
+Use a validated local image through `STLV_TRAFORO_DEV_BINARY` for local testing.
+The fixture restores the initial helper and host state. Complete any macOS
+authorization dialog needed for restoration. A canceled restoration is not a
+passing acceptance run.
+
+### Local transport shutdown regression
+
+Run `uv run pytest tests/tunnel/test_transport.py -n 0` to check SSH process ownership
+and bounded shutdown. On macOS, the real-process regression creates a child that
+ignores SIGTERM. Shutdown must confirm that the process group has no live members
+before it reaps the SSH leader. If confirmation fails, cleanup reports an error
+and retains ownership for a retry. These tests do not deploy AWS resources or
+change host networking.
+
+Set `STLV_TEST_SSH_INTEROP=1` to include the local OpenSSH interoperability test.
+
+### Owner-reported host observations
+
+The networking child holds the helper lease. It reads one helper snapshot for
+each session status request and reports each VPC's observed unit, generation,
+and state. A missing unit is reported as null. These observations do not replace
+DNS, routing, or database readiness checks. Other processes must use the session
+report instead of requesting active helper status directly.
+
+Run the real two-unit observation regression with:
+
+```bash
+uv run pytest tests/integration/test_tunnel_observation.py \
+  --integration-macos-privileged -n 0
+```
+
+It verifies observed active, retained, and recovered generations with real owned
+routes and resolver files. It also verifies that the second unit does not change.
+The shared reporter keeps each host-unit record within the default console width
+so standalone and dev commands can both expose the observation without wrapping.
+
+### Tunnel acceptance teardown
+
+Tunnel startup has a 900-second limit. Destruction has a separate 3,600-second
+limit because DocumentDB deletion and Lambda VPC interface cleanup can outlast
+startup. A separate, bounded AWS absence audit runs after destruction, including
+when the command fails. Dev acceptance captures its proof Lambda log groups
+before destruction, removes only those names after AWS confirms the Functions are
+gone, and verifies that the full proof app/environment prefix is absent. A group
+that appears after capture fails the audit and is not added to the deletion set.
+The runner needs logs:DescribeLogGroups and logs:DeleteLogGroup permissions for
+these proof-owned groups. Reaching the destroy deadline is a test failure.
+
+Each CLI command saves `stdout.log`, `stderr.log`, and `command.json` under a
+private `cli-<command>-*` directory in the proof project. Timeout records include
+partial output and name the app, environment, project, and recovery commands.
+Retain these files when reporting a failure.
+
+If destruction is interrupted, inspect the proof and verify that no deployment
+operation or Pulumi process remains. Only then use `stlv unlock <env>` from that
+proof project if its deployment state is locked, and run `stlv destroy <env> --yes`
+to finish cleanup. Independently audit AWS absence afterward. Tests never unlock
+or retry automatically, and a cleanup retry does not change a failed acceptance
+result. Do not erase helper journals, force-delete in-use interfaces, or change
+IAM permissions to make the test pass.
+
+### Active-session observation
+
+The AWS tests read helper-confirmed unit states and generations from the running
+command's owner reports. The command log starts empty for each invocation. Tests
+use the latest observation and reject unavailable runtime status or an exited
+command. They inspect the helper directly only before startup and after shutdown.
+Cleanup polling can wait for owner rejection to end, but uncertain ownership or
+an expired deadline fails acceptance.

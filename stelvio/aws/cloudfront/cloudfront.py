@@ -1,0 +1,300 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, TypedDict, final
+
+import pulumi
+import pulumi_aws
+
+from stelvio import context
+from stelvio.aws.acm import AcmValidatedDomain, AcmValidatedDomainCustomizationDict
+from stelvio.aws.api_gateway.validators import url_domain, validate_domain_name
+from stelvio.component import Component
+from stelvio.dns import DnsProviderNotConfiguredError
+from stelvio.provider import ProviderStore
+
+if TYPE_CHECKING:
+    from pulumi_aws.cloudfront import CachePolicyArgs, DistributionArgs, OriginAccessControlArgs
+    from pulumi_aws.s3 import BucketPolicyArgs
+
+    from stelvio.aws.s3.s3 import Bucket
+    from stelvio.customize import ChildCustomization, Customization, CustomizationNoArgs
+    from stelvio.dns import Record
+
+
+# TODO: Consider using internal names for these
+# https://www.pulumi.com/registry/packages/aws/api-docs/cloudfront/distribution/#inputs
+CloudfrontPriceClass = Literal["PriceClass_100", "PriceClass_200", "PriceClass_All"]
+
+
+class FunctionAssociation(TypedDict):
+    event_type: str
+    function_arn: str
+
+
+@final
+@dataclass(frozen=True)
+class CloudFrontDistributionResources:
+    distribution: pulumi_aws.cloudfront.Distribution
+    origin_access_control: pulumi_aws.cloudfront.OriginAccessControl
+    cache_policy: pulumi_aws.cloudfront.CachePolicy
+    acm_validated_domain: AcmValidatedDomain
+    record: Record
+    bucket_policy: pulumi_aws.s3.BucketPolicy
+    function_associations: list[FunctionAssociation] | None
+
+
+class CloudFrontDistributionCustomizationDict(TypedDict, total=False):
+    distribution: Customization[DistributionArgs]
+    origin_access_control: Customization[OriginAccessControlArgs]
+    cache_policy: Customization[CachePolicyArgs]
+    acm_validated_domain: ChildCustomization[AcmValidatedDomainCustomizationDict]
+    record: CustomizationNoArgs  # No specific Pulumi Args (cross cloud compat)
+    bucket_policy: Customization[BucketPolicyArgs]
+
+
+@final
+class CloudFrontDistribution(
+    Component[CloudFrontDistributionResources, CloudFrontDistributionCustomizationDict]
+):
+    def __init__(  # noqa: PLR0913
+        self,
+        name: str,
+        bucket: Bucket,
+        price_class: CloudfrontPriceClass | None = None,
+        custom_domain: str | None = None,
+        function_associations: list[FunctionAssociation] | None = None,
+        *,
+        tags: dict[str, str] | None = None,
+        customize: CloudFrontDistributionCustomizationDict | None = None,
+        parent: pulumi.Resource | None = None,
+    ):
+        """Create a CloudFront distribution backed by an S3 bucket.
+
+        Args:
+            name: Unique component name.
+            bucket: S3 Bucket to serve as the origin.
+            price_class: CloudFront price class for edge locations. Defaults to
+                `PriceClass_100`.
+            custom_domain: Custom domain name for the distribution.
+            function_associations: CloudFront function associations.
+            tags: AWS tags for this distribution's resources.
+            customize: Per-resource overrides for distribution, OAC, or cache policy.
+            parent: Parent resource for nesting. Used by S3StaticWebsite
+                which creates a CloudFrontDistribution internally.
+        """
+        super().__init__(
+            ProviderStore.aws(),
+            "stelvio:aws:CloudFrontDistribution",
+            name,
+            tags=tags,
+            customize=customize,
+            parent=parent,
+        )
+        self.bucket = bucket
+        self.custom_domain = custom_domain
+        self.price_class = price_class
+        # Truthy check: "" keeps meaning "no domain", e.g. `os.getenv("DOMAIN", "")`.
+        if custom_domain:
+            validate_domain_name(custom_domain, field_name="custom_domain", wildcard=True)
+        self.function_associations = function_associations or []
+
+    def _create_resources(self) -> CloudFrontDistributionResources:
+        # Create ACM Validated Domain if custom domain is provided
+        acm_validated_domain = None
+        if self.custom_domain:
+            if context().dns is None:
+                raise DnsProviderNotConfiguredError("DNS not configured.")
+            # CloudFront requires ACM certificates in us-east-1
+            acm_validated_domain = AcmValidatedDomain(
+                f"{self.name}-acm-validated-domain",
+                domain_name=self.custom_domain,
+                tags=self.tags,
+                customize=self._customize.get("acm_validated_domain"),
+                region="us-east-1",
+                parent=self,
+            )
+
+        # Create Origin Access Control for S3
+        origin_access_control = pulumi_aws.cloudfront.OriginAccessControl(
+            context().prefix(f"{self.name}-oac"),
+            **self._customizer(
+                "origin_access_control",
+                {},
+                default_props={
+                    "description": f"Origin Access Control for {self.name}",
+                    "origin_access_control_origin_type": "s3",
+                    "signing_behavior": "always",
+                    "signing_protocol": "sigv4",
+                },
+            ),
+            opts=self._resource_opts(),
+        )
+
+        # Create Cache Policy
+        cache_policy = pulumi_aws.cloudfront.CachePolicy(
+            context().prefix(f"{self.name}-cache-policy"),
+            **self._customizer(
+                "cache_policy",
+                {},
+                default_props={
+                    "comment": f"Cache policy for {self.name}",
+                    "parameters_in_cache_key_and_forwarded_to_origin": {
+                        "cookies_config": {
+                            "cookie_behavior": "none",
+                        },
+                        "headers_config": {
+                            "header_behavior": "whitelist",
+                            "headers": {
+                                "items": ["If-Modified-Since"],
+                            },
+                        },
+                        "query_strings_config": {
+                            "query_string_behavior": "none",
+                        },
+                        "enable_accept_encoding_gzip": True,
+                        "enable_accept_encoding_brotli": True,
+                    },
+                    "max_ttl": 3600,
+                    "min_ttl": 0,
+                    "default_ttl": 300,
+                },
+            ),
+            opts=self._resource_opts(),
+        )
+
+        # Create CloudFront Distribution
+        distribution = pulumi_aws.cloudfront.Distribution(
+            context().prefix(self.name),
+            **self._customizer(
+                "distribution",
+                {
+                    "aliases": [self.custom_domain] if self.custom_domain else None,
+                    "origins": [
+                        {
+                            "domain_name": self.bucket.resources.bucket.bucket_regional_domain_name,  # noqa: E501
+                            "origin_id": f"{self.name}-S3-Origin",
+                            "origin_access_control_id": origin_access_control.id,
+                        }
+                    ],
+                    "default_cache_behavior": {
+                        "allowed_methods": [
+                            "GET",
+                            "HEAD",
+                            "OPTIONS",
+                        ],  # Reduced to read-only methods
+                        "cached_methods": ["GET", "HEAD"],
+                        "target_origin_id": f"{self.name}-S3-Origin",
+                        "compress": True,
+                        "viewer_protocol_policy": "redirect-to-https",
+                        "cache_policy_id": cache_policy.id,
+                        "function_associations": self.function_associations,
+                    },
+                    "price_class": self.price_class,
+                    "viewer_certificate": {
+                        "acm_certificate_arn": acm_validated_domain.resources.certificate.arn,
+                        "ssl_support_method": "sni-only",
+                        "minimum_protocol_version": "TLSv1.2_2021",
+                    }
+                    if self.custom_domain
+                    else None,
+                },
+                default_props={
+                    "enabled": True,
+                    "price_class": "PriceClass_100",
+                    "viewer_certificate": {"cloudfront_default_certificate": True},
+                    "is_ipv6_enabled": True,
+                    "default_root_object": "index.html",
+                    "custom_error_responses": [
+                        {
+                            "error_code": 403,
+                            "response_code": 404,
+                            "response_page_path": "/error.html",
+                            "error_caching_min_ttl": 0,  # Don't cache 403 errors
+                        },
+                        {
+                            "error_code": 404,
+                            "response_code": 404,
+                            "response_page_path": "/error.html",
+                            "error_caching_min_ttl": 300,  # Cache 404s for only 5 minutes
+                        },
+                    ],
+                    "restrictions": {
+                        "geo_restriction": {
+                            "restriction_type": "none",
+                        }
+                    },
+                },
+                inject_tags=True,
+            ),
+            opts=self._resource_opts(),
+        )
+
+        # Update S3 bucket policy to allow CloudFront access
+        bucket_policy = pulumi_aws.s3.BucketPolicy(
+            context().prefix(f"{self.name}-bucket-policy"),
+            **self._customizer(
+                "bucket_policy",
+                {"bucket": self.bucket.resources.bucket.id},
+                default_props={
+                    "policy": pulumi.Output.all(
+                        distribution_arn=distribution.arn,
+                        bucket_arn=self.bucket.arn,
+                    ).apply(
+                        lambda args: pulumi.Output.json_dumps(
+                            {
+                                "Version": "2012-10-17",
+                                "Statement": [
+                                    {
+                                        "Sid": "AllowCloudFrontServicePrincipal",
+                                        "Effect": "Allow",
+                                        "Principal": {"Service": "cloudfront.amazonaws.com"},
+                                        "Action": "s3:GetObject",
+                                        "Resource": f"{args['bucket_arn']}/*",
+                                        "Condition": {
+                                            "StringEquals": {
+                                                "AWS:SourceArn": args["distribution_arn"]
+                                            }
+                                        },
+                                    }
+                                ],
+                            }
+                        )
+                    ),
+                },
+            ),
+            opts=self._resource_opts(
+                depends_on=[distribution]
+            ),  # Ensure policy is applied after distribution
+        )
+
+        record = None
+        if self.custom_domain:
+            record = context().dns.create_record(
+                resource_name=context().prefix(f"{self.name}-cloudfront-record"),
+                **self._customizer(
+                    "record",
+                    {
+                        "name": self.custom_domain,
+                    },
+                    default_props={
+                        "record_type": "CNAME",
+                        "value": distribution.domain_name,
+                        "ttl": 1,
+                    },
+                ),
+                opts=self._resource_opts(),
+            )
+
+        domain = url_domain(self.custom_domain) or distribution.domain_name
+        self.register_outputs({"url": pulumi.Output.concat("https://", domain)})
+
+        return CloudFrontDistributionResources(
+            distribution,
+            origin_access_control,
+            cache_policy,
+            acm_validated_domain,
+            record,
+            bucket_policy,
+            self.function_associations,
+        )

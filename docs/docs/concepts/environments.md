@@ -1,0 +1,165 @@
+# Environments
+
+Stelvio makes it easy to manage different deployment environments like
+development, staging, and production. Each environment gets its own isolated AWS
+resources with automatic naming to prevent conflicts.
+
+## How Environments Work
+
+When you deploy with Stelvio, every AWS resource gets named with this pattern:
+
+```
+{app-name}-{environment}-{resource-name}
+```
+
+For example, if your app is called "my-api" and you deploy to the "staging"
+environment, a DynamoDB table named "users" becomes `my-api-staging-users`.
+
+## Default Behavior
+
+If you don't specify an environment, Stelvio uses your personal environment. By default it's your computer username lowercased and reduced to letters, digits and `-`, so `John.Doe` becomes `john-doe`:
+
+```bash
+stlv deploy  # Deploys to your personal environment (e.g., "john")
+```
+
+If nothing is left after the cleaning (a username with no Latin letters or digits, such as `Иван`), `stlv` stops and tells you to set the name in `.stelvio/userenv` (see below).
+
+This gives every developer their own isolated sandbox to work in without
+conflicts.
+
+### Customizing Your Personal Environment Name
+
+Stelvio stores your personal environment name in `.stelvio/userenv`. You can customize this if needed:
+
+```bash
+echo "myname" > .stelvio/userenv
+```
+
+If you already deployed under the old name, `stlv destroy` first: `stlv` accepts only the saved name or a declared environment, so after the change the old stack is out of reach.
+
+This is useful when:
+
+- Multiple developers on the team have the same computer username
+- You want a consistent name across different machines
+- You want to use something other than your computer username
+
+!!! info
+    The `.stelvio/` folder contains personal settings and caches - add it to `.gitignore`.
+
+## Using Environments
+
+Most CLI commands accept an optional environment name as an argument:
+
+```bash
+stlv deploy              # Your personal environment
+stlv deploy staging      # Staging environment
+stlv deploy prod         # Production environment
+```
+
+Without an environment argument, commands default to your personal environment. See [Using CLI](../intro/using-cli.md) for the full list of commands.
+
+## Configuring Environments
+
+You can define which environments are valid for your project:
+
+```python
+from stelvio.config import StelvioAppConfig
+
+
+@app.config
+def configuration(env: str) -> StelvioAppConfig:
+    return StelvioAppConfig(
+        environments=["staging", "prod"]  # Valid shared environments
+    )
+```
+
+With this configuration:
+
+- **Anyone** can deploy to their personal environment (username)
+- **Only** "staging" and "prod" are accepted as shared environments
+- Stelvio will validate environment names and show an error for invalid ones
+
+## Environment-Specific Configuration
+
+You can customize settings based on the environment:
+
+```python
+from stelvio.app import StelvioApp
+from stelvio.config import AwsConfig, StelvioAppConfig
+
+app = StelvioApp("my-app")
+
+
+@app.config
+def configuration(env: str) -> StelvioAppConfig:
+    if env == "prod":
+        # Production uses separate AWS account
+        return StelvioAppConfig(
+            aws=AwsConfig(profile="production-account"),
+            environments=["staging", "prod"]
+        )
+
+    # Staging/personal use default account
+    return StelvioAppConfig(environments=["staging", "prod"])
+```
+
+You can also create environment specific resources:
+
+```python
+from stelvio import context
+from stelvio.aws.dynamo_db import DynamoTable
+from stelvio.aws.function import Function
+
+
+@app.run
+def run() -> None:
+    if context().env == "prod":
+        # Production-specific resources
+        Function("backup", handler="functions/backup.run")
+
+    # Common resources for all environments
+    DynamoTable("users", fields={"user_id": "string"}, partition_key="user_id")
+```
+
+## Tips
+
+- Keep environment names short: `dev`, `staging`, `prod`
+- App and environment names use only letters, digits and single `-` between them, and the app name starts with a letter. `stlv` stops before deploying anything otherwise.
+- Consider using different AWS accounts for production
+
+## Resource Naming
+
+### Naming Pattern
+
+All AWS resources follow the `{app}-{env}-{name}` pattern. Some resources have additional suffixes to identify their type:
+
+| Resource | Pattern |
+|----------|---------|
+| IAM Roles | `{app}-{env}-{name}-r` |
+| IAM Policies | `{app}-{env}-{name}-p`|
+| Router origin access control | `{app}-{env}-{router}-{component}-oac` |
+| Router CloudFront Function that strips the route path | `{app}-{env}-{router}-{component}-rw` |
+| Router permission to call a Function URL | `{app}-{env}-{router}-{component}-perm` |
+| Router Lambda@Edge for a URL route | `{app}-{env}-{router}-{component}-edge` |
+| Router CloudFront Function that returns 404 (no `/` route) | `{app}-{env}-{router}-default-404` |
+
+In Router names, `{component}` is the routed component's name. For a URL route it is `url-` and a hash of the route path, and the Lambda@Edge's IAM role ends in `-r`.
+
+### Automatic Truncation
+
+When a name would exceed AWS limits, Stelvio automatically truncates it and adds a 7-character hash to keep it unique:
+
+```text
+# This name is too long for the 64-char IAM role limit
+myapp-prod-process-user-authentication-requests-handler-r
+
+# Stelvio truncates and adds a hash for uniqueness
+myapp-prod-process-user-authentication-request-e4f2a91-r
+```
+
+The hash is derived from the original name, so:
+
+- The same name always produces the same truncated result
+- Different long names won't collide even if they start the same way
+- You can still identify the resource from the readable portion

@@ -1,0 +1,195 @@
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, final
+
+from pulumi_aws import appsync
+
+from stelvio.aws.appsync.config import (
+    AppSyncPipeFunctionCustomizationDict,
+    AppSyncResolverCustomizationDict,
+)
+from stelvio.aws.appsync.constants import (
+    APPSYNC_JS_RUNTIME,
+    APPSYNC_JS_RUNTIME_VERSION,
+    DS_TYPE_LAMBDA,
+    NONE_PASSTHROUGH_CODE,
+)
+from stelvio.aws.appsync.file_inputs import read_js_code_input
+from stelvio.component import Component, resource_name
+from stelvio.provider import ProviderStore
+
+if TYPE_CHECKING:
+    from pulumi import Resource
+
+    from stelvio.aws.appsync.appsync import AppSync
+    from stelvio.aws.appsync.data_source import AppSyncDataSource
+
+
+@final
+@dataclass(frozen=True)
+class AppSyncResolverResources:
+    resolver: "appsync.Resolver"
+
+
+@final
+@dataclass(frozen=True)
+class AppSyncPipeFunctionResources:
+    function: "appsync.Function"
+
+
+@final
+@dataclass(frozen=True, kw_only=True)
+class AppsyncResolverConfig:
+    type_name: str
+    field_name: str
+    data_source: "AppSyncDataSource | list[PipeFunction] | None"
+    code: str | None = None
+
+
+@final
+class AppSyncResolver(Component[AppSyncResolverResources, AppSyncResolverCustomizationDict]):
+    """A resolver registered with an AppSync API.
+
+    Created by AppSync resolver methods (query, mutation, subscription, resolver).
+    """
+
+    def __init__(
+        self,
+        api: "AppSync",
+        config: AppsyncResolverConfig,
+        *,
+        customize: AppSyncResolverCustomizationDict | None = None,
+        parent: "Resource | None" = None,
+    ) -> None:
+        super().__init__(
+            ProviderStore.aws(),
+            "stelvio:aws:AppSyncResolver",
+            f"{api.name}-resolver-{config.type_name}-{config.field_name}",
+            customize=customize,
+            parent=parent,
+        )
+        self._api = api
+        self._config = config
+
+    @property
+    def type_name(self) -> str:
+        return self._config.type_name
+
+    @property
+    def field_name(self) -> str:
+        return self._config.field_name
+
+    def _create_resources(self) -> AppSyncResolverResources:
+        api_id = self._api.resources.api.id
+
+        resolver_args: dict[str, Any] = {
+            "type": self._config.type_name,
+            "field": self._config.field_name,
+            "code": read_js_code_input(self._config.code) if self._config.code else None,
+        }
+        defaults: dict[str, Any] = {
+            "api_id": api_id,
+            "runtime": appsync.ResolverRuntimeArgs(
+                name=APPSYNC_JS_RUNTIME,
+                runtime_version=APPSYNC_JS_RUNTIME_VERSION,
+            ),
+        }
+
+        if isinstance(self._config.data_source, list):
+            functions = self._config.data_source
+            resolver_args["kind"] = "PIPELINE"
+            resolver_args["pipeline_config"] = appsync.ResolverPipelineConfigArgs(
+                functions=[pf.resources.function.function_id for pf in functions],
+            )
+            defaults["code"] = NONE_PASSTHROUGH_CODE
+            deps = [pf.resources.function for pf in functions]
+        else:
+            resolver_args["kind"] = "UNIT"
+            if self._config.data_source is None:
+                defaults["data_source"] = "NONE"
+                defaults["code"] = NONE_PASSTHROUGH_CODE
+                deps = [self._api.none_data_source]
+            else:
+                ds = self._config.data_source
+                resolver_args["data_source"] = ds.name
+                if ds.ds_type == DS_TYPE_LAMBDA and self._config.code is None:
+                    del defaults["runtime"]
+                deps = [ds.resources.data_source]
+
+        resolver_name = f"{self._api.name}-{self._config.type_name}-{self._config.field_name}"
+        resolver = appsync.Resolver(
+            resource_name(resolver_name, limit=128),
+            **self._customizer("resolver", resolver_args, defaults),
+            opts=self._resource_opts(depends_on=deps),
+        )
+        return AppSyncResolverResources(resolver=resolver)
+
+
+@final
+class PipeFunction(Component[AppSyncPipeFunctionResources, AppSyncPipeFunctionCustomizationDict]):
+    """A pipeline function (step) registered with an AppSync API.
+
+    Created by AppSync.pipe_function(). Pass a list of PipeFunctions as the
+    data_source argument to resolver methods for pipeline resolvers.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        api: "AppSync",
+        name: str,
+        data_source: "AppSyncDataSource | None",
+        *,
+        code: str,
+        customize: AppSyncPipeFunctionCustomizationDict | None = None,
+        parent: "Resource | None" = None,
+    ) -> None:
+        self._pipe_function_name = name
+        super().__init__(
+            ProviderStore.aws(),
+            "stelvio:aws:PipeFunction",
+            f"{api.name}-fn-{name}",
+            customize=customize,
+            parent=parent,
+        )
+        self._api = api
+        self._data_source = data_source
+        self._code = code
+
+    @property
+    def name(self) -> str:
+        return self._pipe_function_name
+
+    @property
+    def api_name(self) -> str:
+        return self._api.name
+
+    def _create_resources(self) -> AppSyncPipeFunctionResources:
+        api_id = self._api.resources.api.id
+
+        ds_dep = (
+            self._data_source.resources.data_source
+            if self._data_source
+            else self._api.none_data_source
+        )
+
+        appsync_fn = appsync.Function(
+            resource_name(f"{self._api.name}-fn-{self.name}", limit=128),
+            **self._customizer(
+                "function",
+                {
+                    "name": self.name,
+                    "data_source": self._data_source.name if self._data_source else None,
+                    "code": read_js_code_input(self._code),
+                },
+                {
+                    "api_id": api_id,
+                    "data_source": "NONE",
+                    "runtime": appsync.FunctionRuntimeArgs(
+                        name=APPSYNC_JS_RUNTIME,
+                        runtime_version=APPSYNC_JS_RUNTIME_VERSION,
+                    ),
+                },
+            ),
+            opts=self._resource_opts(depends_on=[ds_dep]),
+        )
+
+        return AppSyncPipeFunctionResources(function=appsync_fn)

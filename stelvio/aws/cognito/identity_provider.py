@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, final
+
+import pulumi_aws
+from pulumi import Output
+
+from stelvio.aws.cognito.types import IdentityProviderConfig, IdentityProviderCustomizationDict
+from stelvio.aws.cognito.user_pool import UserPool  # noqa: TC001
+from stelvio.component import Component, resource_name
+from stelvio.provider import ProviderStore
+
+if TYPE_CHECKING:
+    from pulumi import Resource
+
+MAX_IDENTITY_PROVIDER_NAME_LENGTH = 128
+
+
+@final
+@dataclass(frozen=True)
+class IdentityProviderResources:
+    identity_provider: pulumi_aws.cognito.IdentityProvider
+
+
+@final
+class IdentityProvider(Component[IdentityProviderResources, IdentityProviderCustomizationDict]):
+    """Cognito identity provider for federated authentication.
+
+    Represents a configured identity provider (Google, Facebook, OIDC, SAML, etc.)
+    attached to a UserPool. Created via UserPool.add_identity_provider().
+    """
+
+    _user_pool: UserPool
+    _config: IdentityProviderConfig
+
+    def __init__(
+        self,
+        name: str,
+        /,
+        *,
+        user_pool: UserPool,
+        config: IdentityProviderConfig,
+        customize: IdentityProviderCustomizationDict | None = None,
+        parent: Resource | None = None,
+    ) -> None:
+        super().__init__(
+            ProviderStore.aws(),
+            "stelvio:aws:IdentityProvider",
+            name,
+            customize=customize,
+            parent=parent,
+        )
+        self._user_pool = user_pool
+        self._config = config
+
+    @property
+    def provider_name(self) -> Output[str]:
+        return Output.from_input(self._config.provider_name)
+
+    def _create_resources(self) -> IdentityProviderResources:
+        pool = self._user_pool.resources.user_pool
+
+        idp_args: dict[str, Any] = {
+            "provider_name": self._config.provider_name,
+            "provider_type": self._config.provider_type,
+            "provider_details": self._config.details,
+        }
+        if self._config.attributes is not None:
+            idp_args["attribute_mapping"] = self._config.attributes
+
+        identity_provider = pulumi_aws.cognito.IdentityProvider(
+            resource_name(self.name, limit=MAX_IDENTITY_PROVIDER_NAME_LENGTH),
+            **self._customizer("identity_provider", idp_args, {"user_pool_id": pool.id}),
+            opts=self._resource_opts(),
+        )
+
+        self.register_outputs({})
+        return IdentityProviderResources(identity_provider=identity_provider)

@@ -1,0 +1,266 @@
+import time
+
+import pytest
+
+from stelvio.aws.function import Function
+from stelvio.aws.function.config import FunctionUrlConfig
+from stelvio.aws.layer import Layer
+from stelvio.aws.vpc import NatConfig, Vpc
+
+from .assert_helpers import (
+    assert_lambda_function,
+    assert_lambda_function_url,
+    assert_lambda_tags,
+    get_lambda_vpc_config,
+    invoke_lambda,
+)
+from .assert_vpc import get_security_group
+from .export_helpers import export_function, export_vpc
+
+pytestmark = pytest.mark.integration
+
+# Right after a fresh deploy AWS can drop a VPC Lambda's first outbound connects with the NAT
+# available and every route active (2 of 4 runs, always open again by +30 s).
+_NAT_EGRESS_TIMEOUT = 120
+_NAT_EGRESS_INTERVAL = 10
+# 4 probes 10 s apart span those 30 s, so broken isolation answers True at least once
+_ISOLATED_PROBES = 4
+
+
+# --- Properties ---
+
+
+def test_function_basic(stelvio_env, project_dir):
+    def infra():
+        fn = Function("echo", handler="handlers/echo.main")
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_lambda_function(
+        outputs["function_echo_arn"],
+        runtime="python3.12",
+        memory=128,
+        timeout=60,
+    )
+
+
+def test_function_tags(stelvio_env, project_dir):
+    def infra():
+        fn = Function("tagged-fn", handler="handlers/echo.main", tags={"Team": "platform"})
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+    assert_lambda_tags(outputs["function_tagged-fn_arn"], {"Team": "platform"})
+
+
+@pytest.mark.parametrize(
+    ("name", "kwargs"),
+    [
+        ("custom-mem", {"memory": 256, "timeout": 30}),
+        ("custom-env", {"environment": {"MY_VAR": "hello", "OTHER_VAR": "world"}}),
+        ("arm-fn", {"architecture": "arm64"}),
+        ("py311", {"runtime": "python3.11"}),
+    ],
+)
+def test_function_config(stelvio_env, project_dir, name, kwargs):
+    def infra():
+        fn = Function(name, handler="handlers/echo.main", **kwargs)
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_lambda_function(outputs[f"function_{name}_arn"], **kwargs)
+
+
+def test_function_folder(stelvio_env, project_dir):
+    def infra():
+        fn = Function("with-folder", handler="handlers::echo.main")
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_lambda_function(outputs["function_with-folder_arn"])
+    # Bundling correctness can't be verified via config — must invoke to prove it works
+    result = invoke_lambda(outputs["function_with-folder_arn"])
+    assert result["statusCode"] == 200
+
+
+def test_function_requirements(stelvio_env, project_dir):
+    def infra():
+        fn = Function(
+            "with-deps",
+            handler="handlers/echo.main",
+            requirements=["requests"],
+        )
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_lambda_function(outputs["function_with-deps_arn"])
+    # Bundling correctness can't be verified via config — must invoke to prove it works
+    result = invoke_lambda(outputs["function_with-deps_arn"])
+    assert result["statusCode"] == 200
+
+
+# --- Function URL ---
+
+
+def test_function_url_public(stelvio_env, project_dir):
+    def infra():
+        fn = Function("public-api", handler="handlers/echo.main", url="public")
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert "function_public-api_url" in outputs
+    assert outputs["function_public-api_url"].startswith("https://")
+    assert_lambda_function_url(
+        outputs["function_public-api_arn"],
+        auth_type="NONE",
+        cors=True,
+    )
+
+
+def test_function_url_private(stelvio_env, project_dir):
+    def infra():
+        fn = Function("private-api", handler="handlers/echo.main", url="private")
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert "function_private-api_url" in outputs
+    assert_lambda_function_url(
+        outputs["function_private-api_arn"],
+        auth_type="AWS_IAM",
+        cors=False,
+    )
+
+
+def test_function_url_streaming(stelvio_env, project_dir):
+    def infra():
+        fn = Function(
+            "stream-fn",
+            handler="handlers/echo.main",
+            url=FunctionUrlConfig(cors=True, streaming=True),
+        )
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert "function_stream-fn_url" in outputs
+    assert_lambda_function_url(
+        outputs["function_stream-fn_arn"],
+        auth_type="NONE",
+        cors=True,
+        invoke_mode="RESPONSE_STREAM",
+    )
+
+
+def test_function_url_custom_cors(stelvio_env, project_dir):
+    def infra():
+        fn = Function(
+            "cors-fn",
+            handler="handlers/echo.main",
+            url=FunctionUrlConfig(
+                cors={
+                    "allow_origins": ["https://example.com"],
+                    "allow_methods": ["GET", "POST"],
+                    "allow_headers": ["Content-Type"],
+                },
+            ),
+        )
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_lambda_function_url(
+        outputs["function_cors-fn_arn"],
+        auth_type="NONE",
+        cors=True,
+        cors_origins=["https://example.com"],
+    )
+
+
+# --- Layers ---
+
+
+def test_function_with_layer(stelvio_env, project_dir):
+    def infra():
+        layer = Layer("utils", code="handlers/layer_code")
+        fn = Function("with-layer", handler="handlers/echo.main", layers=[layer])
+        export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    assert_lambda_function(
+        outputs["function_with-layer_arn"],
+        layers_count=1,
+    )
+
+
+# --- VPC ---
+
+
+@pytest.mark.integration_vpc
+def test_function_in_vpc(stelvio_env, project_dir):
+    def infra():
+        vpc = Vpc("net", az=2)
+        private = Function("private", handler="handlers/net_probe.main", vpc=vpc)
+        isolated = Function(
+            "isolated", handler="handlers/net_probe.main", vpc={"vpc": vpc, "subnets": "isolated"}
+        )
+        outside = Function("outside", handler="handlers/net_probe.main")
+        export_vpc(vpc)
+        for fn in (private, isolated, outside):
+            export_function(fn)
+
+    outputs = stelvio_env.deploy(infra)
+
+    # behavior: without NAT a function in the VPC is cut off from the internet; the
+    # control outside the VPC proves the probe itself works
+    assert invoke_lambda(outputs["function_private_arn"]) == {"egress": False}
+    assert invoke_lambda(outputs["function_isolated_arn"]) == {"egress": False}
+    assert invoke_lambda(outputs["function_outside_arn"]) == {"egress": True}
+
+    # read-back: without NAT the private and isolated tiers behave the same, and the
+    # shared app security group has nothing to admit until a datastore sources it
+    private_cfg = get_lambda_vpc_config(outputs["function_private_arn"])
+    isolated_cfg = get_lambda_vpc_config(outputs["function_isolated_arn"])
+    assert set(private_cfg["SubnetIds"]) == set(outputs["vpc_net_private_subnet_ids"])
+    assert set(isolated_cfg["SubnetIds"]) == set(outputs["vpc_net_isolated_subnet_ids"])
+    assert len(private_cfg["SecurityGroupIds"]) == 1
+    assert isolated_cfg["SecurityGroupIds"] == private_cfg["SecurityGroupIds"]
+    app_sg = get_security_group(private_cfg["SecurityGroupIds"][0])
+    assert app_sg["IpPermissions"] == []
+    assert [
+        (r["IpProtocol"], r["IpRanges"], r["Ipv6Ranges"]) for r in app_sg["IpPermissionsEgress"]
+    ] == [("-1", [{"CidrIp": "0.0.0.0/0"}], [])]
+
+
+@pytest.mark.integration_vpc
+def test_function_in_vpc_with_nat(stelvio_env, project_dir):
+    def infra():
+        vpc = Vpc("net", az=2, nat=NatConfig(type="managed", single=True))
+        private = Function("private", handler="handlers/net_probe.main", vpc=vpc)
+        isolated = Function(
+            "isolated", handler="handlers/net_probe.main", vpc={"vpc": vpc, "subnets": "isolated"}
+        )
+        export_function(private)
+        export_function(isolated)
+
+    outputs = stelvio_env.deploy(infra)
+
+    # behavior: the NAT serves the private subnets only; isolated stays cut off. A dropped
+    # connect reads as False, so private polls until True and isolated must stay False on
+    # every probe.
+    deadline = time.monotonic() + _NAT_EGRESS_TIMEOUT
+    egress = invoke_lambda(outputs["function_private_arn"])
+    while egress != {"egress": True} and time.monotonic() < deadline:
+        time.sleep(_NAT_EGRESS_INTERVAL)
+        egress = invoke_lambda(outputs["function_private_arn"])
+    assert egress == {"egress": True}
+    for probe in range(_ISOLATED_PROBES):
+        if probe:
+            time.sleep(_NAT_EGRESS_INTERVAL)
+        assert invoke_lambda(outputs["function_isolated_arn"]) == {"egress": False}, probe

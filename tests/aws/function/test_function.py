@@ -1,0 +1,1650 @@
+"""
+In these tests we tests that Stelvio creates proper Pulumi resources.
+
+For Function we need to test:
+
+- [x] Validation of FunctionConfig
+- [x] FunctionConfig helper properties
+- [x] Validation of Function's init (_parse_config)
+- [x] Check that FunctionConfigDict matches FunctionConfig
+- [x] Check that Function properties return proper value
+- [x] Check that `_create_resource`:
+        - [x] Creates proper lambda role with proper iam statements
+        - [x] Creates proper resource file for lambda
+        - [x] Creates proper resource file for IDE (test with multiple single-file
+                lambdas in the same folder)
+        - [x] Creates properly configured Pulumi's Function object:
+                - [x] that have proper envvars
+                - [x] Uses settings passed from config: handler, memory, timeout
+                - [x] With packaged proper code for single file and folder based lambdas
+"""
+
+import json
+import os
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from functools import partial
+from pathlib import Path
+from unittest.mock import patch
+
+import pulumi
+import pytest
+from pulumi import (
+    Asset,
+    AssetArchive,
+    FileArchive,
+    FileAsset,
+    RemoteAsset,
+    StringAsset,
+)
+from pulumi.runtime import MockResourceArgs
+from pytest import mark, param, raises
+
+from stelvio.aws._packaging.dependencies import RequirementsSpec
+from stelvio.aws.function import Function
+from stelvio.aws.function.constants import DEFAULT_MEMORY, DEFAULT_TIMEOUT
+from stelvio.aws.function.dependencies import _FUNCTION_CACHE_SUBDIR
+from stelvio.aws.layer import Layer
+from stelvio.aws.permission import AwsPermission
+from stelvio.aws.queue import Queue
+from stelvio.aws.types import (
+    DEFAULT_ARCHITECTURE,
+    DEFAULT_RUNTIME,
+    AwsArchitecture,
+    AwsLambdaRuntime,
+)
+from stelvio.link import Link, Linkable
+
+from ...conftest import TP
+from ..conftest import assert_hash_truncated
+from ..pulumi_mocks import R
+
+LAMBDA_ASSUME_ROLE_POLICY = [
+    {
+        "actions": ["sts:AssumeRole"],
+        "principals": [{"identifiers": ["lambda.amazonaws.com"], "type": "Service"}],
+    }
+]
+
+LINK_FILE_IMPORTS = """import os
+from dataclasses import dataclass
+from typing import Final
+from functools import cached_property"""
+
+TEST_LINK_DATACLASS_TXT = """@dataclass(frozen=True)
+class TestLinkResource:
+    @cached_property
+    def name(self) -> str:
+        return os.environ["STLV_TEST_LINK_NAME"]
+
+    @cached_property
+    def timeout(self) -> str:
+        return os.environ["STLV_TEST_LINK_TIMEOUT"]
+"""
+
+TEST_LINK_2_DATACLASS_TXT = """@dataclass(frozen=True)
+class TestLink2Resource:
+    @cached_property
+    def name2(self) -> str:
+        return os.environ["STLV_TEST_LINK2_NAME2"]
+
+    @cached_property
+    def timeout2(self) -> str:
+        return os.environ["STLV_TEST_LINK2_TIMEOUT2"]
+"""
+
+TEST_LINK_FILE_CONTENT = f"""{LINK_FILE_IMPORTS}
+\n\n{TEST_LINK_DATACLASS_TXT}\n
+@dataclass(frozen=True)
+class LinkedResources:
+    test_link: Final[TestLinkResource] = TestLinkResource()
+\n
+Resources: Final = LinkedResources()"""
+
+TEST_LINK_FILE_CONTENT_IDE = TEST_LINK_FILE_CONTENT
+
+TEST_LINK_2_FILE_CONTENT = f"""{LINK_FILE_IMPORTS}
+\n\n{TEST_LINK_2_DATACLASS_TXT}\n
+@dataclass(frozen=True)
+class LinkedResources:
+    test_link2: Final[TestLink2Resource] = TestLink2Resource()
+\n
+Resources: Final = LinkedResources()"""
+
+TEST_LINK_2_FILE_CONTENT_IDE_SF = f"""{LINK_FILE_IMPORTS}
+\n\n{TEST_LINK_DATACLASS_TXT}\n\n{TEST_LINK_2_DATACLASS_TXT}\n
+@dataclass(frozen=True)
+class LinkedResources:
+    test_link: Final[TestLinkResource] = TestLinkResource()
+    test_link2: Final[TestLink2Resource] = TestLink2Resource()
+\n
+Resources: Final = LinkedResources()"""
+
+TEST_LINK_2_FILE_CONTENT_IDE_FB = TEST_LINK_2_FILE_CONTENT
+
+pytestmark = pytest.mark.usefixtures("project_cwd")
+
+
+@dataclass
+class FunctionTestCase:
+    test_id: str
+    name: str
+    input_handler: str
+    expected_handler: str
+    expected_code_assets: dict[str, tuple[type[Asset], str]]
+    links: list[Link | Linkable] = field(default_factory=list)
+    expected_envars: dict[str, str | int] = field(default_factory=dict)
+    expected_policy: list[dict[str, list[str]]] | None = None
+    expected_ide_file: tuple[str, str] | None = None
+    layers: list[Callable[[], Layer]] | None = None
+    expected_layers: list[str] | None = None
+    requirements: list[str] | str | bool | None = None
+    create_default_requirements_at: str | None = None
+    runtime: AwsLambdaRuntime | None = None
+    arch: AwsArchitecture | None = None
+
+
+def assert_function_configuration(function_args, test_case: FunctionTestCase):
+    # Check lambda configuration
+    assert function_args.name == TP + test_case.name
+    assert function_args.inputs["handler"] == test_case.expected_handler
+    assert function_args.inputs["runtime"] == test_case.runtime or DEFAULT_RUNTIME
+    assert function_args.inputs["architectures"] == [test_case.arch or DEFAULT_ARCHITECTURE]
+    assert function_args.inputs["memorySize"] == DEFAULT_MEMORY
+    assert function_args.inputs["timeout"] == DEFAULT_TIMEOUT
+    assert function_args.inputs["environment"] == {"variables": test_case.expected_envars}
+
+
+def assert_function_layers(function_args, expected_layers_arns: list[str] | None):
+    actual_layers_output = function_args.inputs.get("layers")
+
+    if expected_layers_arns is None:
+        assert actual_layers_output is None
+        return
+
+    assert actual_layers_output is not None
+    assert isinstance(actual_layers_output, list)
+    assert sorted(actual_layers_output) == sorted(expected_layers_arns)
+
+
+def assert_function_code(
+    function_args: MockResourceArgs,
+    project_cwd,
+    assets: dict[str, tuple[type[Asset], str]],
+    expected_dependencies_path: Path | None,
+):
+    # Check lambda code
+    code: AssetArchive = function_args.inputs["code"]
+
+    for name, (asset_type, path_text_uri) in assets.items():
+        asset = code.assets[name]
+        assert isinstance(asset, asset_type)
+        if isinstance(asset, FileAsset):
+            assert asset.path == str(project_cwd / path_text_uri)
+        elif isinstance(asset, StringAsset):
+            assert asset.text == path_text_uri
+        elif isinstance(asset, RemoteAsset):
+            assert asset.uri == path_text_uri
+
+    if not expected_dependencies_path:
+        return
+    # Check dependency archive
+    expected_depencencies_key = ""  # direct lambda dependencies are at root
+    assert expected_depencencies_key in code.assets
+    dependencies_archive_asset = code.assets[expected_depencencies_key]
+    assert isinstance(dependencies_archive_asset, FileArchive)
+    assert dependencies_archive_asset.path == str(expected_dependencies_path)
+
+
+def expected_layer_arn(layer_name: str) -> str:
+    return f"arn:aws:lambda:us-east-1:123456789012:layer:{TP + layer_name}-test-name:1"
+
+
+def create_layer(name=None, runtime=None, arch=None):
+    return Layer(
+        name=name or "mock-layer-1",
+        requirements=["dummy-req"],
+        runtime=runtime or DEFAULT_RUNTIME,
+        architecture=arch or DEFAULT_ARCHITECTURE,
+    )
+
+
+SIMPLE_SF_TC = FunctionTestCase(
+    test_id="simple_single_file",
+    name="simple-single-file-function",
+    input_handler="functions/simple.handler",
+    expected_handler="simple.handler",
+    expected_code_assets={"simple.py": (FileAsset, "functions/simple.py")},
+)
+SIMPLE_FB_TC = FunctionTestCase(
+    test_id="simple_folder_based",
+    name="simple-folder-based-function",
+    input_handler="functions/folder::handler.process",
+    expected_handler="handler.process",
+    expected_code_assets={"handler.py": (FileAsset, "functions/folder/handler.py")},
+)
+LINK_PROPS_SF_TC = replace(
+    SIMPLE_SF_TC,
+    test_id="link_props_single_file",
+    links=[Link("test-link", properties={"name": "link-name", "timeout": 10}, permissions=[])],
+    expected_code_assets={
+        "simple.py": (FileAsset, "functions/simple.py"),
+        "stlv_resources.py": (StringAsset, TEST_LINK_FILE_CONTENT),
+    },
+    expected_envars={"STLV_TEST_LINK_NAME": "link-name", "STLV_TEST_LINK_TIMEOUT": 10},
+    expected_ide_file=("functions/stlv_resources.py", TEST_LINK_FILE_CONTENT_IDE),
+)
+LINK2_PROPS_SF_TC = replace(
+    LINK_PROPS_SF_TC,
+    links=[Link("test-link2", properties={"name2": "link-name2", "timeout2": 20}, permissions=[])],
+    expected_code_assets={
+        "simple.py": (FileAsset, "functions/simple.py"),
+        "stlv_resources.py": (StringAsset, TEST_LINK_2_FILE_CONTENT),
+    },
+    expected_envars={"STLV_TEST_LINK2_NAME2": "link-name2", "STLV_TEST_LINK2_TIMEOUT2": 20},
+    expected_ide_file=("functions/stlv_resources.py", TEST_LINK_2_FILE_CONTENT_IDE_SF),
+)
+LINK2_PROPS_SF2_TC = replace(
+    LINK2_PROPS_SF_TC,
+    name="simple2-single-file-function",
+    input_handler="functions/simple2.handler",
+    expected_handler="simple2.handler",
+    expected_code_assets={
+        "simple2.py": (FileAsset, "functions/simple2.py"),
+        "stlv_resources.py": (StringAsset, TEST_LINK_2_FILE_CONTENT),
+    },
+    expected_ide_file=("functions/stlv_resources.py", TEST_LINK_2_FILE_CONTENT_IDE_SF),
+)
+LINK_PROPS_FB_TC = replace(
+    SIMPLE_FB_TC,
+    test_id="link_props_folder_based",
+    links=LINK_PROPS_SF_TC.links,
+    expected_code_assets={
+        "handler.py": (FileAsset, "functions/folder/handler.py"),
+        "stlv_resources.py": (StringAsset, TEST_LINK_FILE_CONTENT),
+    },
+    expected_envars=LINK_PROPS_SF_TC.expected_envars,
+    expected_ide_file=("functions/folder/stlv_resources.py", TEST_LINK_FILE_CONTENT_IDE),
+)
+LINK2_PROPS_FB_TC = replace(
+    LINK_PROPS_FB_TC,
+    links=LINK2_PROPS_SF_TC.links,
+    expected_code_assets={
+        "handler.py": (FileAsset, "functions/folder/handler.py"),
+        "stlv_resources.py": (StringAsset, TEST_LINK_2_FILE_CONTENT),
+    },
+    expected_envars=LINK2_PROPS_SF_TC.expected_envars,
+    expected_ide_file=(
+        "functions/folder/stlv_resources.py",
+        # We use content for single-file because both test folder-based functions
+        # refer to the same folder so they share stlv resource file!
+        TEST_LINK_2_FILE_CONTENT_IDE_SF,
+    ),
+)
+LINK2_PROPS_FB2_TC = replace(
+    LINK_PROPS_FB_TC,
+    name="simple2-folder-based-function",
+    input_handler="functions/folder2::handler.process",
+    links=LINK2_PROPS_SF_TC.links,
+    expected_code_assets={
+        "handler.py": (FileAsset, "functions/folder2/handler.py"),
+        "stlv_resources.py": (StringAsset, TEST_LINK_2_FILE_CONTENT),
+    },
+    expected_envars=LINK2_PROPS_SF_TC.expected_envars,
+    expected_ide_file=("functions/folder2/stlv_resources.py", TEST_LINK_2_FILE_CONTENT_IDE_FB),
+)
+REQUIREMENTS_LIST_SF_TC = replace(
+    SIMPLE_SF_TC, test_id="requirements_as_list_single_file", requirements=["boto3", "requests"]
+)
+REQUIREMENTS_DEFAULT_FILE_SF_TC = replace(
+    SIMPLE_SF_TC,
+    test_id="requirements_default_file_single_file",
+    create_default_requirements_at="functions/requirements.txt",
+)
+REQUIREMENTS_DEFAULT_FILE_OFF_SF_TC = replace(
+    SIMPLE_SF_TC,
+    test_id="requirements_default_file_off_single_file",
+    requirements=False,
+    create_default_requirements_at="functions/requirements.txt",
+)
+REQUIREMENTS_BLANK_LIST_SF_TC = replace(
+    SIMPLE_SF_TC,
+    test_id="requirements_blank_list_disables_single_file",
+    requirements=["", "  "],
+    create_default_requirements_at="functions/requirements.txt",
+)
+REQUIREMENTS_DEFAULT_FILE_BUT_CUSTOM_FILE_SF_TC = replace(
+    SIMPLE_SF_TC,
+    test_id="requirements_default_file_but_use_custom_file_single_file",
+    requirements="functions/custom_requirements.txt",
+    create_default_requirements_at="functions/requirements.txt",
+)
+REQUIREMENTS_DEFAULT_FILE_BUT_CUSTOM_LIST_SF_TC = replace(
+    SIMPLE_SF_TC,
+    test_id="requirements_default_file_but_custom_list_single_file",
+    requirements=["boto3", "requests"],
+    create_default_requirements_at="functions/requirements.txt",
+)
+REQUIREMENTS_LIST_CUSTOM_RUNTIME_ARCH_SF_TC = replace(
+    SIMPLE_SF_TC,
+    test_id="requirements_as_list_custom_runtime_and_arch_single_file",
+    requirements=["boto3", "requests"],
+    runtime="python3.13",
+    arch="arm64",
+)
+# --
+REQUIREMENTS_LIST_FB_TC = replace(
+    SIMPLE_FB_TC, test_id="requirements_as_list_folder_based", requirements=["boto3", "requests"]
+)
+REQUIREMENTS_DEFAULT_FILE_FB_TC = replace(
+    SIMPLE_FB_TC,
+    test_id="requirements_default_file_folder_based",
+    create_default_requirements_at="functions/folder/requirements.txt",
+)
+REQUIREMENTS_DEFAULT_FILE_OFF_FB_TC = replace(
+    SIMPLE_FB_TC,
+    test_id="requirements_default_file_off_folder_based",
+    requirements=False,
+    create_default_requirements_at="functions/folder/requirements.txt",
+)
+REQUIREMENTS_DEFAULT_FILE_BUT_CUSTOM_FILE_FB_TC = replace(
+    SIMPLE_FB_TC,
+    test_id="requirements_default_file_but_use_custom_file_folder_based",
+    requirements="functions/custom_requirements.txt",
+    create_default_requirements_at="functions/folder/requirements.txt",
+)
+REQUIREMENTS_DEFAULT_FILE_BUT_CUSTOM_LIST_FB_TC = replace(
+    SIMPLE_FB_TC,
+    test_id="requirements_default_file_but_custom_list_folder_based",
+    requirements=["boto3", "requests"],
+    create_default_requirements_at="functions/folder/requirements.txt",
+)
+REQUIREMENTS_LIST_CUSTOM_RUNTIME_ARCH_FB_TC = replace(
+    SIMPLE_FB_TC,
+    test_id="requirements_as_list_custom_runtime_and_arch_folder_based",
+    requirements=["boto3", "requests"],
+    runtime="python3.13",
+    arch="arm64",
+)
+
+LINK_PROPS_PERMISSIONS_SF_TC = replace(
+    LINK_PROPS_SF_TC,
+    test_id="link_props_permissions_single_file",
+    links=[
+        Link(
+            "test-link",
+            properties={"name": "link-name", "timeout": 10},
+            permissions=[
+                AwsPermission(
+                    actions=["dynamodb:Query", "dynamodb:GetItem"],
+                    resources=["arn:aws:dynamodb:us-east-1:123456789012:table/my-table"],
+                )
+            ],
+        )
+    ],
+    expected_policy=[
+        {
+            "actions": ["dynamodb:Query", "dynamodb:GetItem"],
+            "resources": ["arn:aws:dynamodb:us-east-1:123456789012:table/my-table"],
+        }
+    ],
+)
+
+ONE_LAYER_SF_TC = replace(
+    SIMPLE_SF_TC,
+    test_id="one_layer_single_file",
+    layers=[create_layer],
+    expected_layers=[expected_layer_arn("mock-layer-1")],
+)
+
+MULTI_LAYER_FB_TC = replace(
+    SIMPLE_FB_TC,
+    test_id="multi_layer_folder_based",
+    layers=[create_layer, partial(create_layer, name="mock-layer-2")],
+    expected_layers=[
+        expected_layer_arn("mock-layer-1"),
+        expected_layer_arn("mock-layer-2"),
+    ],
+)
+
+
+def _assert_iam_policy(pulumi_mocks, test_case: FunctionTestCase):
+    """Verify the IAM policy creation."""
+    if test_case.expected_policy:
+        pulumi_mocks.assert_res(
+            f"{test_case.name}-p",
+            R.POLICY,
+            {"policy": json.dumps(test_case.expected_policy), "path": "/"},
+            partial=True,
+        )
+    else:
+        pulumi_mocks.assert_no_res(R.POLICY)
+
+
+def _assert_iam_role(pulumi_mocks, test_case: FunctionTestCase):
+    """Verify the IAM role creation."""
+    pulumi_mocks.assert_res(
+        f"{test_case.name}-r",
+        R.ROLE,
+        {"assumeRolePolicy": json.dumps(LAMBDA_ASSUME_ROLE_POLICY)},
+    )
+
+
+def _assert_role_attachments(pulumi_mocks, test_case: FunctionTestCase, function: Function):
+    """Verify the IAM role policy attachments, and that `resources.policy` is the attached one."""
+    name = TP + test_case.name
+    role = f"{name}-r-test-name"
+    policy_arn = f"arn:aws:iam::123456789012:policy/{name}-p-test-name"
+    expected = [
+        (
+            f"{name}-basic-execution-r-p-attachment",
+            {
+                "role": role,
+                "policyArn": "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+            },
+        )
+    ]
+    if test_case.expected_policy:
+        expected.append(
+            (f"{name}-default-r-p-attachment", {"role": role, "policyArn": policy_arn})
+        )
+
+        @pulumi.runtime.test
+        def check_policy_handle():
+            def check(arn):
+                assert arn == policy_arn
+
+            return function.resources.policy.arn.apply(check)
+
+        check_policy_handle()
+    else:
+        assert function.resources.policy is None
+    attachments = sorted(pulumi_mocks.created(R.ROLE_POLICY_ATTACHMENT), key=lambda a: a.name)
+    assert [(a.name, a.inputs) for a in attachments] == expected
+
+
+def _assert_lambda_function(
+    pulumi_mocks,
+    project_cwd,
+    test_case: FunctionTestCase,
+    expected_dependencies_path: Path | None,
+):
+    function_args = pulumi_mocks.assert_res(
+        test_case.name,
+        R.FUNCTION,
+        {"role": f"arn:aws:iam::123456789012:role/{TP}{test_case.name}-r-test-name"},
+        partial=True,
+    )
+
+    assert_function_configuration(function_args, test_case)
+    assert_function_code(
+        function_args, project_cwd, test_case.expected_code_assets, expected_dependencies_path
+    )
+    assert_function_layers(function_args, expected_layers_arns=test_case.expected_layers)
+
+
+def _assert_ide_file(project_cwd, test_case: FunctionTestCase):
+    if test_case.expected_ide_file:
+        file_path = project_cwd / test_case.expected_ide_file[0]
+        assert file_path.exists(), f"IDE resource file not found at {file_path}"
+        assert file_path.read_text() == test_case.expected_ide_file[1], "IDE file content mismatch"
+
+
+def verify_function_resources(
+    pulumi_mocks,
+    project_cwd,
+    function: Function,
+    test_case: FunctionTestCase,
+    expected_dependencies_path: Path | None,
+):
+    _assert_iam_policy(pulumi_mocks, test_case)
+    _assert_iam_role(pulumi_mocks, test_case)
+    _assert_role_attachments(pulumi_mocks, test_case, function)
+    _assert_lambda_function(pulumi_mocks, project_cwd, test_case, expected_dependencies_path)
+    _assert_ide_file(project_cwd, test_case)
+
+
+@pulumi.runtime.test
+def test_function_properties(pulumi_mocks, project_cwd):
+    function = Function("simple-single-file-function", handler="functions/simple.handler")
+    function_resource = function.resources.function
+
+    def check_properties(args):
+        name, invoke_arn, resource_name, resource_invoke_arn = args
+        assert name == resource_name
+        assert invoke_arn == resource_invoke_arn
+
+    pulumi.Output.all(
+        function.function_name,
+        function.invoke_arn,
+        function_resource.name,
+        function_resource.invoke_arn,
+    ).apply(check_properties)
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        SIMPLE_SF_TC,
+        SIMPLE_FB_TC,
+        LINK_PROPS_SF_TC,
+        LINK_PROPS_FB_TC,
+        LINK_PROPS_PERMISSIONS_SF_TC,
+        replace(
+            LINK_PROPS_FB_TC,
+            test_id="link_props_permissions_folder_based",
+            links=LINK_PROPS_PERMISSIONS_SF_TC.links,
+            expected_policy=LINK_PROPS_PERMISSIONS_SF_TC.expected_policy,
+        ),
+        REQUIREMENTS_LIST_SF_TC,
+        REQUIREMENTS_LIST_FB_TC,
+        REQUIREMENTS_DEFAULT_FILE_SF_TC,
+        REQUIREMENTS_DEFAULT_FILE_FB_TC,
+        REQUIREMENTS_DEFAULT_FILE_OFF_SF_TC,
+        REQUIREMENTS_BLANK_LIST_SF_TC,
+        REQUIREMENTS_DEFAULT_FILE_OFF_FB_TC,
+        REQUIREMENTS_DEFAULT_FILE_BUT_CUSTOM_FILE_SF_TC,
+        REQUIREMENTS_DEFAULT_FILE_BUT_CUSTOM_FILE_FB_TC,
+        REQUIREMENTS_DEFAULT_FILE_BUT_CUSTOM_LIST_SF_TC,
+        REQUIREMENTS_DEFAULT_FILE_BUT_CUSTOM_LIST_FB_TC,
+        REQUIREMENTS_LIST_CUSTOM_RUNTIME_ARCH_SF_TC,
+        REQUIREMENTS_LIST_CUSTOM_RUNTIME_ARCH_FB_TC,
+        ONE_LAYER_SF_TC,
+        MULTI_LAYER_FB_TC,
+    ],
+    ids=lambda test_case: test_case.test_id,
+)
+def test_function__(
+    mock_get_or_install_dependencies_function,
+    mock_get_or_install_dependencies_layer,
+    pulumi_mocks,
+    project_cwd,
+    test_case,
+):
+    # Arrange
+    function = Function(
+        test_case.name,
+        handler=test_case.input_handler,
+        links=test_case.links,
+        layers=[layer() for layer in test_case.layers] if test_case.layers else None,
+        requirements=test_case.requirements,
+        runtime=test_case.runtime,
+        architecture=test_case.arch,
+    )
+    if test_case.create_default_requirements_at:
+        (project_cwd / test_case.create_default_requirements_at).touch()
+    if isinstance(test_case.requirements, str):
+        (project_cwd / test_case.requirements).touch()
+
+    # Act
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    # Assert
+    requirements = test_case.requirements
+    if isinstance(requirements, list):  # an empty or blank-only list disables dependencies
+        expect_requirements = any(line.strip() for line in requirements)
+    else:
+        expect_requirements = bool(requirements) or (
+            test_case.create_default_requirements_at and requirements is not False
+        )
+    dependencies_path = (
+        mock_get_or_install_dependencies_function.return_value if expect_requirements else None
+    )
+    verify_function_resources(pulumi_mocks, project_cwd, function, test_case, dependencies_path)
+    if expect_requirements:
+        mock_get_or_install_dependencies_function.assert_called_once_with(
+            requirements_source=RequirementsSpec(
+                content="\n".join(requirements) if isinstance(requirements, list) else None,
+                path_from_root=Path(requirements)
+                if isinstance(requirements, str)
+                else (
+                    Path(test_case.create_default_requirements_at)
+                    if test_case.create_default_requirements_at
+                    and requirements is not False
+                    and not isinstance(requirements, list)
+                    else None
+                ),
+            ),
+            runtime=test_case.runtime or DEFAULT_RUNTIME,
+            architecture=test_case.arch or DEFAULT_ARCHITECTURE,
+            project_root=project_cwd,
+            log_context=f"Function: {test_case.input_handler}",
+            cache_subdirectory=_FUNCTION_CACHE_SUBDIR,
+        )
+    else:
+        mock_get_or_install_dependencies_function.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "test_case_set",
+    [
+        [LINK_PROPS_SF_TC, replace(LINK2_PROPS_SF_TC, name=LINK2_PROPS_SF_TC.name + "2nd")],
+        [LINK_PROPS_SF_TC, LINK2_PROPS_SF2_TC],
+        [LINK_PROPS_FB_TC, replace(LINK2_PROPS_FB_TC, name=LINK2_PROPS_FB_TC.name + "2nd")],
+        [LINK_PROPS_FB_TC, LINK2_PROPS_FB2_TC],
+    ],
+    ids=[
+        "ide_files_two_single_file_from_same_file",
+        "ide_files_two_single_file_from_different_files",
+        "ide_files_two_folder_based_from_same_folder",
+        "ide_files_two_folder_based_from_different_folders",
+    ],
+)
+def test_functions_multiple__(pulumi_mocks, project_cwd, test_case_set):
+    @pulumi.runtime.test
+    def deploy(function):
+        return function.resources
+
+    for test_case in test_case_set:
+        function = Function(test_case.name, handler=test_case.input_handler, links=test_case.links)
+        deploy(function)
+        verify_function_resources(pulumi_mocks, project_cwd, function, test_case, None)
+        pulumi_mocks.created_resources = []
+
+
+def test_function_long_name_truncates_function_role_and_policy_names(pulumi_mocks, project_cwd):
+    permission = Link("perm", {}, [AwsPermission(actions=["s3:GetObject"], resources=["*"])])
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function(
+            "f" * 120, handler="functions/simple.handler", links=[permission]
+        ).resources
+
+    deploy()
+
+    # Lambda 64, IAM role 64, IAM policy 128, each minus the 8-char Pulumi suffix
+    [function] = pulumi_mocks.created(R.FUNCTION)
+    [role] = pulumi_mocks.created(R.ROLE)
+    [policy] = pulumi_mocks.created(R.POLICY)
+    assert_hash_truncated(function.name, 56)
+    assert_hash_truncated(role.name, 56, suffix="-r")
+    assert_hash_truncated(policy.name, 120, suffix="-p")
+    pulumi_mocks.assert_res_counts(
+        {R.FUNCTION: 1, R.ROLE: 1, R.POLICY: 1, R.ROLE_POLICY_ATTACHMENT: 2}
+    )
+
+
+@pytest.mark.parametrize(
+    ("opts", "error_type", "error_match"),
+    [
+        ({"requirements": "nonexistent.txt"}, FileNotFoundError, "Requirements file not found"),
+        ({"requirements": "functions"}, ValueError, "Requirements path is not a file"),
+        (
+            {"requirements": "../outside-folder/file.txt"},
+            ValueError,
+            "which is outside the project root",
+        ),
+    ],
+    ids=[
+        "requirements_path_does_not_exist",
+        "requirements_path_is_folder",
+        "requirements_path_outside_of_project_root",
+    ],
+)
+@pulumi.runtime.test
+def test_function_raises_when__(project_cwd, pulumi_mocks, opts, error_type, error_match):
+    # Arrange
+    outside_folder = project_cwd / "../outside-folder"
+    outside_folder.mkdir(parents=True)
+    outside_file = outside_folder / "file.txt"
+    outside_file.touch()
+    # Act & Assert
+    with pytest.raises(error_type, match=error_match):
+        _ = Function("my-function", handler="functions/simple.handler", **opts).resources
+
+
+def test_function_folder_package_excludes_the_ide_resources_file(pulumi_mocks, project_cwd):
+    """The on-disk stlv_resources.py is the folder's IDE union (a linked sibling may have
+    written it); a function without links packages no copy of it."""
+    (project_cwd / "functions/folder/stlv_resources.py").write_text("# from an earlier build\n")
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("plain", handler="functions/folder::handler.process").resources
+
+    deploy()
+
+    code: AssetArchive = pulumi_mocks.assert_res("plain", R.FUNCTION).inputs["code"]
+    assert set(code.assets) == {"handler.py", "handler2.py"}
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+def test_function_folder_package_includes_a_symlinked_file_under_its_link_name(
+    pulumi_mocks, project_cwd
+):
+    folder = project_cwd / "functions/folder"
+    (folder / "linked.py").symlink_to(project_cwd / "functions/simple.py")
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("plain", handler="functions/folder::handler.process").resources
+
+    deploy()
+
+    code: AssetArchive = pulumi_mocks.assert_res("plain", R.FUNCTION).inputs["code"]
+    assert set(code.assets) == {"handler.py", "handler2.py", "linked.py"}
+    assert code.assets["linked.py"].path == str(folder / "linked.py")
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+def test_function_folder_package_skips_a_symlinked_folder_with_a_warning(
+    pulumi_mocks, project_cwd
+):
+    # Shared code belongs in a Layer; following the link would pack another function's folder.
+    (project_cwd / "functions/folder/shared").symlink_to(project_cwd / "functions/folder2")
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("plain", handler="functions/folder::handler.process").resources
+
+    with patch("pulumi.log.warn") as warn:
+        deploy()
+
+    code: AssetArchive = pulumi_mocks.assert_res("plain", R.FUNCTION).inputs["code"]
+    assert set(code.assets) == {"handler.py", "handler2.py"}
+    warn.assert_called_once_with(
+        "Function folder 'functions/folder' has a symlink to a folder, 'shared', which is not "
+        "packaged. Shared code belongs in a Layer."
+    )
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+@pulumi.runtime.test
+def test_function_folder_package_fails_on_a_broken_symlink(pulumi_mocks, project_cwd):
+    # Pulumi would fail on the missing file much later, naming only the function.
+    (project_cwd / "functions/folder/dangling.py").symlink_to("nope.py")
+
+    with raises(
+        ValueError,
+        match=r"Function folder 'functions/folder' has a broken symlink: dangling.py -> nope.py",
+    ):
+        _ = Function("plain", handler="functions/folder::handler.process").resources
+
+
+def test_function_folder_package_skips_a_symlink_to_a_fifo(pulumi_mocks, project_cwd):
+    # Neither a file nor a folder, and not broken either: not packaged, no error.
+    os.mkfifo(project_cwd / "pipe")
+    (project_cwd / "functions/folder/pipe").symlink_to(project_cwd / "pipe")
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("plain", handler="functions/folder::handler.process").resources
+
+    deploy()
+
+    code: AssetArchive = pulumi_mocks.assert_res("plain", R.FUNCTION).inputs["code"]
+    assert set(code.assets) == {"handler.py", "handler2.py"}
+
+
+@mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root reads any folder")
+@pulumi.runtime.test
+def test_function_folder_package_fails_on_an_unreadable_subfolder(pulumi_mocks, project_cwd):
+    # Packaging without the folder's files would fail on Lambda at import time instead.
+    locked = project_cwd / "functions/folder/locked"
+    locked.mkdir()
+    (locked / "x.py").write_text("")
+    locked.chmod(0)
+    try:
+        with raises(PermissionError, match="locked"):
+            _ = Function("plain", handler="functions/folder::handler.process").resources
+    finally:
+        locked.chmod(0o755)
+
+
+@mark.parametrize("full_first", [param(True, id="full_first"), param(False, id="trimmed_first")])
+def test_function_folder_resources_file_unions_link_properties_in_any_build_order(
+    pulumi_mocks, project_cwd, full_first
+):
+    """One stlv_resources.py per handler folder serves the IDE, so it lists every property any
+    function in the folder links to, whichever builds last. Each Lambda's copy stays its own."""
+    link = Link("test-link", properties={"name": "link-name", "timeout": 10}, permissions=[])
+    full = Function("full", handler="functions/simple.handler", links=[link])
+    trimmed = Function(
+        "trimmed", handler="functions/simple2.handler", links=[link.remove_properties("timeout")]
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return (
+            [full.resources, trimmed.resources]
+            if full_first
+            else [trimmed.resources, full.resources]
+        )
+
+    deploy()
+
+    assert (project_cwd / "functions/stlv_resources.py").read_text() == TEST_LINK_FILE_CONTENT_IDE
+    trimmed_code = pulumi_mocks.assert_res("trimmed", R.FUNCTION).inputs["code"]
+    assert "STLV_TEST_LINK_TIMEOUT" not in trimmed_code.assets["stlv_resources.py"].text
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 2, R.ROLE: 2, R.ROLE_POLICY_ATTACHMENT: 2})
+
+
+def test_function_accepts_a_link_without_properties(pulumi_mocks, project_cwd):
+    # A permissions-only link; the env-var side always skipped None, the codegen side crashed.
+    link = Link("perms-only", properties=None, permissions=[])
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[link]).resources
+
+    deploy()
+
+    pulumi_mocks.assert_res("fn", R.FUNCTION)
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+def test_function_folder_resources_file_ignores_a_trailing_slash_in_the_folder(
+    pulumi_mocks, project_cwd
+):
+    """`functions/folder/` and `functions/folder` are one folder on disk, so one IDE file
+    listing both functions' links, not two registry entries fighting over it."""
+    first = Function(
+        "first", handler="functions/folder::handler.process", links=LINK_PROPS_SF_TC.links
+    )
+    second = Function(
+        "second",
+        folder="functions/folder/",
+        handler="handler2.process",
+        links=LINK2_PROPS_SF_TC.links,
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return [first.resources, second.resources]
+
+    deploy()
+
+    ide_file = project_cwd / "functions/folder/stlv_resources.py"
+    assert ide_file.read_text() == TEST_LINK_2_FILE_CONTENT_IDE_SF
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 2, R.ROLE: 2, R.ROLE_POLICY_ATTACHMENT: 2})
+
+
+# Bridge Mode Tests
+BRIDGE_MODE_SF_TC = replace(
+    SIMPLE_SF_TC,
+    test_id="dev_mode_single_file",
+    expected_handler="function_stub.handler",
+    expected_code_assets={"function_stub.py": (StringAsset, "stub-content")},
+)
+
+BRIDGE_MODE_FB_TC = replace(
+    SIMPLE_FB_TC,
+    test_id="dev_mode_folder_based",
+    expected_handler="function_stub.handler",
+    expected_code_assets={"function_stub.py": (StringAsset, "stub-content")},
+)
+
+BRIDGE_MODE_WITH_LINKS_SF_TC = replace(
+    LINK_PROPS_SF_TC,
+    test_id="dev_mode_with_links_single_file",
+    expected_handler="function_stub.handler",
+    expected_code_assets={"function_stub.py": (StringAsset, "stub-content")},
+    expected_envars={
+        **LINK_PROPS_SF_TC.expected_envars,
+        "STLV_APPSYNC_REALTIME": "wss://test-realtime.appsync.amazonaws.com",
+        "STLV_APPSYNC_HTTP": "https://test-http.appsync.amazonaws.com",
+        "STLV_APPSYNC_API_KEY": "test-api-key-123",
+        "STLV_APP_NAME": "test",
+        "STLV_STAGE": "test",
+        "STLV_FUNCTION_NAME": LINK_PROPS_SF_TC.name,
+    },
+)
+
+BRIDGE_MODE_WITH_LAYERS_SF_TC = replace(
+    ONE_LAYER_SF_TC,
+    test_id="dev_mode_with_layers_single_file",
+    expected_handler="function_stub.handler",
+    expected_code_assets={"function_stub.py": (StringAsset, "stub-content")},
+)
+
+
+def _assert_bridge_env_vars(function_args, test_case: FunctionTestCase):
+    """Verify bridge-specific environment variables are present."""
+    env_vars = function_args.inputs["environment"]["variables"]
+
+    # Check required bridge env vars
+    assert "STLV_APPSYNC_REALTIME" in env_vars
+    assert "STLV_APPSYNC_HTTP" in env_vars
+    assert "STLV_APPSYNC_API_KEY" in env_vars
+    assert "STLV_APP_NAME" in env_vars
+    assert "STLV_STAGE" in env_vars
+    assert "STLV_FUNCTION_NAME" in env_vars
+    assert "STLV_DEV_ENDPOINT_ID" in env_vars
+
+    # Verify values
+    assert env_vars["STLV_APPSYNC_REALTIME"] == "wss://test-realtime.appsync.amazonaws.com"
+    assert env_vars["STLV_APPSYNC_HTTP"] == "https://test-http.appsync.amazonaws.com"
+    assert env_vars["STLV_APPSYNC_API_KEY"] == "test-api-key-123"
+    assert env_vars["STLV_APP_NAME"] == "test"
+    assert env_vars["STLV_STAGE"] == "test"
+    assert env_vars["STLV_FUNCTION_NAME"] == test_case.name
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        BRIDGE_MODE_SF_TC,
+        BRIDGE_MODE_FB_TC,
+        BRIDGE_MODE_WITH_LINKS_SF_TC,
+        BRIDGE_MODE_WITH_LAYERS_SF_TC,
+    ],
+    ids=lambda test_case: test_case.test_id,
+)
+@pytest.mark.usefixtures(
+    "mock_get_or_install_dependencies_function",
+    "mock_get_or_install_dependencies_layer",
+    "project_cwd",
+)
+def test_function_dev_mode__(pulumi_mocks, dev_mode_context, test_case):
+    """Test that functions are created correctly in bridge mode."""
+    mock_discover, mock_bridge_archive = dev_mode_context
+
+    # Create function with required config
+    function_kwargs = {
+        "handler": test_case.input_handler,
+    }
+    if test_case.links:
+        function_kwargs["links"] = test_case.links
+    if test_case.layers:
+        function_kwargs["layers"] = [layer() for layer in test_case.layers]
+
+    function = Function(test_case.name, **function_kwargs)
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+
+    # Verify AppSync was discovered
+    mock_discover.assert_called_once()
+
+    # Verify bridge archive was created
+    mock_bridge_archive.assert_called_once()
+
+    function_args = pulumi_mocks.assert_res(
+        test_case.name, R.FUNCTION, {"handler": "stlv_function_stub.handler"}, partial=True
+    )
+
+    # Check bridge environment variables
+    _assert_bridge_env_vars(function_args, test_case)
+
+    # Verify code uses bridge archive
+    code: AssetArchive = function_args.inputs["code"]
+    assert "stlv_function_stub.py" in code.assets
+    assert isinstance(code.assets["stlv_function_stub.py"], StringAsset)
+
+    # If test case has layers, verify they're still applied
+    if test_case.expected_layers:
+        assert_function_layers(function_args, test_case.expected_layers)
+
+
+@pulumi.runtime.test
+def test_function_dev_mode_discovers_bridge_in_default_region(
+    project_cwd, pulumi_mocks, no_region_context, request
+):
+    """Bridge AppSync discovery uses the chain-resolved default region — with no region
+    configured (the default new-user setup), the raw context region would be None."""
+    # Requested in the body: dev_mode_context copies the live context, so it must run after
+    # no_region_context has replaced it, and argument order doesn't guarantee that.
+    mock_discover, _ = request.getfixturevalue("dev_mode_context")
+
+    _ = Function("test-function", handler="functions/simple.handler").resources
+
+    mock_discover.assert_called_once_with(region="eu-central-1", profile=None)
+
+
+@pulumi.runtime.test
+def test_bridge_event_env_always_injects_function_region(
+    project_cwd, pulumi_mocks, no_region_context
+):
+    """PRIVATE-HELPER test (behavior not observable via Pulumi resources): the local
+    bridge event env always carries the function's region — emulating the Lambda
+    runtime — even when no region is configured (it used to skip injection then)."""
+    function = Function("test-function", handler="functions/simple.handler")
+
+    async def check():
+        env = await function._get_environment_for_bridge_event()
+        assert env["AWS_REGION"] == "eu-central-1"
+        assert env["AWS_DEFAULT_REGION"] == "eu-central-1"
+        assert "AWS_PROFILE" not in env
+
+    return check()
+
+
+@pulumi.runtime.test
+def test_function_dev_mode_registers_handler(project_cwd, pulumi_mocks, dev_mode_context):
+    """Test that function registers itself with WebsocketHandlers in bridge mode."""
+    from stelvio.bridge.local.handlers import WebsocketHandlers
+
+    function = Function("test-function", handler="functions/simple.handler")
+
+    def check_registration(_):
+        assert WebsocketHandlers.all() == [function]
+
+    return function.invoke_arn.apply(check_registration)
+
+
+def test_function_dev_mode_stub_carries_endpoint_id(project_cwd, pulumi_mocks, dev_mode_context):
+    """The stub Lambda's endpoint id is the function name plus an 8-hex random tail."""
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("test-function", handler="functions/simple.handler").resources
+
+    deploy()
+
+    [stub] = pulumi_mocks.created(R.FUNCTION)
+    endpoint_id = stub.inputs["environment"]["variables"]["STLV_DEV_ENDPOINT_ID"]
+    assert re.fullmatch(r"test-function-[0-9a-f]{8}", endpoint_id)
+
+
+# Function Link Tests
+
+FUNCTION_ARN_TEMPLATE = "arn:aws:lambda:us-east-1:123456789012:function:{name}"
+
+
+@pulumi.runtime.test
+def test_function_link(pulumi_mocks, project_cwd):
+    """Test that Function.link() returns correct properties and permissions."""
+    function_name = "my-linkable-function"
+    function = Function(function_name, handler="functions/simple.handler")
+
+    link = function.link()
+
+    def verify_link(args):
+        properties, permissions = args
+
+        # Verify properties include function_arn and function_name
+        expected_name = TP + function_name + "-test-name"
+        expected_arn = FUNCTION_ARN_TEMPLATE.format(name=expected_name)
+        assert properties["function_name"] == expected_name
+        assert properties["function_arn"] == expected_arn
+
+        # Verify permissions
+        assert len(permissions) == 1
+        permission = permissions[0]
+        assert permission.actions == ["lambda:InvokeFunction"]
+        assert len(permission.resources) == 1
+
+        def verify_resource(resource):
+            assert resource == expected_arn
+
+        permission.resources[0].apply(verify_resource)
+
+    pulumi.Output.all(link.properties, link.permissions).apply(verify_link)
+
+
+def test_function_to_function_link(pulumi_mocks, project_cwd):
+    """Test that linking one function to another grants invoke permissions."""
+
+    @pulumi.runtime.test
+    def deploy():
+        target = Function("target-function", handler="functions/simple.handler")
+        return Function(
+            "caller-function", handler="functions/simple.handler", links=[target]
+        ).resources
+
+    deploy()
+
+    policy = pulumi_mocks.assert_res("caller-function-p", R.POLICY)
+    expected_target_arn = FUNCTION_ARN_TEMPLATE.format(name=TP + "target-function-test-name")
+    assert json.loads(policy.inputs["policy"]) == [
+        {"actions": ["lambda:InvokeFunction"], "resources": [expected_target_arn]}
+    ]
+
+
+def test_function_to_function_link_env_vars(pulumi_mocks, project_cwd):
+    """Test that linking to a function creates correct environment variables."""
+
+    @pulumi.runtime.test
+    def deploy():
+        target = Function("target-fn", handler="functions/simple.handler")
+        return Function("caller-fn", handler="functions/simple.handler", links=[target]).resources
+
+    deploy()
+
+    caller = pulumi_mocks.assert_res("caller-fn", R.FUNCTION)
+    expected_target_name = TP + "target-fn-test-name"
+    assert caller.inputs["environment"]["variables"] == {
+        "STLV_TARGET_FN_FUNCTION_ARN": FUNCTION_ARN_TEMPLATE.format(name=expected_target_name),
+        "STLV_TARGET_FN_FUNCTION_NAME": expected_target_name,
+    }
+
+
+def test_function_packages_linked_files(pulumi_mocks, project_cwd):
+    link = Link("certs", {}, [], _files={"certs/ca.pem": project_cwd / "functions" / "orders.py"})
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[link]).resources
+
+    deploy()
+
+    assets = pulumi_mocks.assert_res("fn", R.FUNCTION).inputs["code"].assets
+    assert set(assets) == {"simple.py", "certs/ca.pem"}
+    assert isinstance(assets["certs/ca.pem"], FileAsset)
+    assert Path(assets["certs/ca.pem"].path) == project_cwd / "functions" / "orders.py"
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+def test_function_folder_package_skips_build_and_os_files(pulumi_mocks, project_cwd):
+    # `__pycache__` goes as a whole (the notes.txt inside too), at any depth.
+    folder = project_cwd / "functions" / "folder"
+    for junk in (
+        ".DS_Store",
+        "stale.pyc",
+        "__pycache__/handler.cpython-312.pyc",
+        "__pycache__/notes.txt",
+        "sub/__pycache__/data.json",
+    ):
+        (folder / junk).parent.mkdir(parents=True, exist_ok=True)
+        (folder / junk).write_text("")
+    (folder / "stlv.py").write_text("")
+    (folder / "sub/ok.py").write_text("")
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/folder::handler.process").resources
+
+    deploy()
+
+    assets = pulumi_mocks.assert_res("fn", R.FUNCTION).inputs["code"].assets
+    assert set(assets) == {"handler.py", "handler2.py", "stlv.py", "sub/ok.py"}
+
+
+@mark.parametrize(
+    "make_links",
+    [
+        param(
+            lambda a, b: [
+                Link("first", {}, [], _files={"ca.pem": a}),
+                Link("second", {}, [], _files={"ca.pem": b}),
+            ],
+            id="two-links",
+        ),
+        param(
+            lambda a, b: [Link("certs", {}, [], _files={"ca.pem": a, "./ca.pem": b})],
+            id="same-link-normalize",
+        ),
+    ],
+)
+def test_function_raises_when_links_put_different_files_at_one_path(
+    pulumi_mocks, project_cwd, make_links
+):
+    first_source = project_cwd / "functions" / "orders.py"
+    second_source = project_cwd / "functions" / "users.py"
+    links = make_links(first_source, second_source)
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=links).resources
+
+    message = (
+        f"Link '{links[-1].name}' puts {second_source} at 'ca.pem' in Function 'fn', "
+        f"but 'ca.pem' is already mapped to {first_source}."
+    )
+    with raises(ValueError, match=f"^{re.escape(message)}$"):
+        deploy()
+
+
+def test_function_allows_when_links_put_same_file_at_one_path(pulumi_mocks, project_cwd):
+    shared = project_cwd / "functions" / "orders.py"
+    first = Link("first", {}, [], _files={"ca.pem": shared})
+    second = Link("second", {}, [], _files={"ca.pem": shared})
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[first, second]).resources
+
+    deploy()
+
+    assets = pulumi_mocks.assert_res("fn", R.FUNCTION).inputs["code"].assets
+    assert set(assets) == {"simple.py", "ca.pem"}
+    assert isinstance(assets["ca.pem"], FileAsset)
+    assert Path(assets["ca.pem"].path) == shared
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+@mark.parametrize(
+    ("source_factory", "suffix"),
+    [
+        param(
+            lambda cwd: cwd / "certs" / "missing.pem",
+            "but that file does not exist.",
+            id="missing",
+        ),
+        param(
+            lambda cwd: cwd / "functions",
+            "but that path is not a file.",
+            id="directory",
+        ),
+    ],
+)
+def test_function_raises_when_linked_file_source_invalid(
+    pulumi_mocks, project_cwd, source_factory, suffix
+):
+    source = source_factory(project_cwd)
+    link = Link("certs", {}, [], _files={"ca.pem": source})
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[link]).resources
+
+    message = f"Link 'certs' puts {source} into Function 'fn', {suffix}"
+    with raises(ValueError, match=f"^{re.escape(message)}$"):
+        deploy()
+
+
+def test_function_raises_when_linked_file_source_is_relative(pulumi_mocks, project_cwd):
+    link = Link("certs", {}, [], _files={"ca.pem": "functions/orders.py"})
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[link]).resources
+
+    message = (
+        "Link 'certs' puts 'functions/orders.py' into Function 'fn', "
+        "but linked file sources must be absolute paths."
+    )
+    with raises(ValueError, match=f"^{re.escape(message)}$"):
+        deploy()
+
+
+@mark.parametrize(
+    "zip_path",
+    [
+        param("/etc/ca.pem", id="absolute"),
+        param("../ca.pem", id="parent"),
+        param("certs/../../ca.pem", id="nested-parent"),
+        param("", id="empty"),
+        param(".", id="dot"),
+    ],
+)
+def test_function_raises_when_linked_file_escapes_package(pulumi_mocks, project_cwd, zip_path):
+    link = Link("certs", {}, [], _files={zip_path: project_cwd / "functions" / "orders.py"})
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[link]).resources
+
+    message = (
+        f"Link 'certs' puts a file at '{zip_path}' in Function 'fn', but package paths "
+        "must be relative and stay inside the package."
+    )
+    with raises(ValueError, match=f"^{re.escape(message)}$"):
+        deploy()
+
+
+@mark.parametrize(
+    "zip_path",
+    [
+        param("simple.py", id="exact"),
+        param("./simple.py", id="dot-slash"),
+        param("simple.py/ca.pem", id="handler-is-parent-file"),
+        param("stlv_resources.py/ca.pem", id="generated-module-is-parent-file"),
+    ],
+)
+def test_function_raises_when_linked_file_overwrites_package_file(
+    pulumi_mocks, project_cwd, zip_path
+):
+    link = Link(
+        "certs",
+        {"ca_file": zip_path},
+        [],
+        _files={zip_path: project_cwd / "functions" / "orders.py"},
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[link]).resources
+
+    destination = str(Path(zip_path))
+    message = (
+        f"Linked files {[destination]} conflict with existing paths in the Lambda package. "
+        "Choose a different package path for the linked file."
+    )
+    with raises(ValueError, match=f"^{re.escape(message)}$"):
+        deploy()
+
+
+@mark.parametrize(
+    ("files", "destination", "existing"),
+    [
+        param(
+            lambda cwd: {
+                "certs": cwd / "functions" / "orders.py",
+                "certs/ca.pem": cwd / "functions" / "users.py",
+            },
+            "certs/ca.pem",
+            "certs",
+            id="file-then-child",
+        ),
+        param(
+            lambda cwd: {
+                "certs/ca.pem": cwd / "functions" / "orders.py",
+                "certs": cwd / "functions" / "users.py",
+            },
+            "certs",
+            "certs/ca.pem",
+            id="child-then-file",
+        ),
+    ],
+)
+def test_function_raises_when_linked_file_paths_conflict_as_file_and_directory(
+    pulumi_mocks, project_cwd, files, destination, existing
+):
+    link = Link("certs", {}, [], _files=files(project_cwd))
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[link]).resources
+
+    message = (
+        f"Link 'certs' puts a file at '{destination}' in Function 'fn', but that "
+        f"path conflicts with '{existing}' (a file and a directory cannot share the same "
+        f"path prefix)."
+    )
+    with raises(ValueError, match=f"^{re.escape(message)}$"):
+        deploy()
+
+
+@mark.parametrize(
+    ("dependency_path", "destination"),
+    [
+        param("certifi/cacert.pem", "certifi/cacert.pem", id="same-file"),
+        param("certifi/cacert.pem", "certifi", id="existing-directory"),
+        param("six.py", "six.py/certs/ca.pem", id="dependency-is-parent-file"),
+    ],
+)
+def test_function_raises_when_linked_file_overwrites_dependency(
+    pulumi_mocks, project_cwd, tmp_path, dependency_path, destination
+):
+    cache_dir = tmp_path / "deps"
+    dependency = cache_dir / dependency_path
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("from-pip")
+    link = Link(
+        "certs",
+        {},
+        [],
+        _files={destination: project_cwd / "functions" / "orders.py"},
+    )
+
+    @pulumi.runtime.test
+    def deploy():
+        with patch(
+            "stelvio.aws.function.dependencies.get_or_install_dependencies",
+            return_value=cache_dir,
+        ):
+            return Function(
+                "fn",
+                handler="functions/simple.handler",
+                links=[link],
+                requirements=["certifi"],
+            ).resources
+
+    message = (
+        f"Linked files {[destination]} conflict with dependency paths in the Lambda package. "
+        "Choose a different package path for the linked file."
+    )
+    with raises(ValueError, match=f"^{re.escape(message)}$"):
+        deploy()
+
+
+@mark.parametrize(
+    ("existing_path", "destination"),
+    [
+        param("certs/existing.pem", "certs", id="linked-file-is-parent"),
+        param("certs", "certs/ca.pem", id="source-file-is-parent"),
+    ],
+)
+def test_function_rejects_linked_file_directory_conflicts_in_folder(
+    pulumi_mocks, project_cwd, existing_path, destination
+):
+    folder = project_cwd / "collision"
+    existing = folder / existing_path
+    existing.parent.mkdir(parents=True)
+    existing.write_text("existing")
+    (folder / "handler.py").write_text("def handler(event, context): return {}")
+    source = project_cwd / "functions" / "orders.py"
+    link = Link("certs", {}, [], _files={destination: source})
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="collision::handler.handler", links=[link]).resources
+
+    message = (
+        f"Linked files {[destination]} conflict with existing paths in the Lambda package. "
+        "Choose a different package path for the linked file."
+    )
+    with raises(ValueError, match=f"^{re.escape(message)}$"):
+        deploy()
+
+
+@mark.parametrize("dependency", [False, True], ids=["source", "dependency"])
+@mark.parametrize(
+    "paths",
+    [
+        param(("certs/existing.pem", "certs/ca.pem"), id="siblings"),
+        param(("certs", "certs-extra/ca.pem"), id="existing-prefix-lookalike"),
+        param(("certs-extra/ca.pem", "certs"), id="linked-prefix-lookalike"),
+    ],
+)
+def test_function_packages_linked_files_next_to_existing_paths(
+    pulumi_mocks, project_cwd, dependency, paths
+):
+    existing_path, destination = paths
+    folder = project_cwd / "package"
+    folder.mkdir()
+    handler = folder / "handler.py"
+    handler.write_text("def handler(event, context): return {}")
+    cache_dir = project_cwd / "deps"
+    existing = (cache_dir if dependency else folder) / existing_path
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text("existing")
+    source = project_cwd / "functions" / "orders.py"
+    link = Link("certs", {}, [], _files={destination: source})
+
+    @pulumi.runtime.test
+    def deploy():
+        with patch(
+            "stelvio.aws.function.dependencies.get_or_install_dependencies",
+            return_value=cache_dir,
+        ):
+            return Function(
+                "fn",
+                handler="package::handler.handler",
+                links=[link],
+                requirements=["certifi"] if dependency else False,
+            ).resources
+
+    deploy()
+
+    assets = pulumi_mocks.assert_res("fn", R.FUNCTION).inputs["code"].assets
+    expected = {"handler.py": handler, destination: source}
+    if dependency:
+        expected[""] = cache_dir
+    else:
+        expected[existing_path] = existing
+    assert set(assets) == set(expected)
+    for key, path in expected.items():
+        assert isinstance(assets[key], FileArchive if key == "" else FileAsset)
+        assert Path(assets[key].path) == path
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+@mark.usefixtures("dev_mode_context")
+def test_function_dev_mode_validates_linked_files(pulumi_mocks, project_cwd):
+    source = project_cwd / "certs" / "missing.pem"
+    link = Link("certs", {}, [], _files={"ca.pem": source})
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[link]).resources
+
+    message = f"Link 'certs' puts {source} into Function 'fn', but that file does not exist."
+    with raises(ValueError, match=f"^{re.escape(message)}$"):
+        deploy()
+
+
+def test_function_dev_mode_stub_omits_linked_files(pulumi_mocks, project_cwd, dev_mode_context):
+    _, mock_bridge_archive = dev_mode_context
+    link = Link("certs", {}, [], _files={"ca.pem": project_cwd / "functions" / "orders.py"})
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[link]).resources
+
+    deploy()
+
+    mock_bridge_archive.assert_called_once()
+    assets = pulumi_mocks.assert_res("fn", R.FUNCTION).inputs["code"].assets
+    assert set(assets) == {"stlv_function_stub.py"}
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+@mark.parametrize(
+    "kwargs",
+    [
+        param({}, id="defaults"),
+        param({"architecture": "x86_64", "runtime": "python3.13"}, id="user"),
+    ],
+)
+def test_function_dev_mode_stub_deps_match_stub_lambda(
+    pulumi_mocks, project_cwd, dev_mode_context, kwargs
+):
+    # The stub ignores the function's own runtime and arch. Deps built for another arch only
+    # worked because websockets falls back to pure Python.
+    _, mock_bridge_archive = dev_mode_context
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", **kwargs).resources
+
+    deploy()
+
+    pulumi_mocks.assert_res(
+        "fn", R.FUNCTION, {"runtime": "python3.12", "architectures": ["arm64"]}, partial=True
+    )
+    # The real archive builder pip-installs the deps, so the fixture mocks it and its
+    # arguments are the only record of the platform the deps target.
+    mock_bridge_archive.assert_called_once_with("python3.12", "arm64")
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+def _file_read_bridge_event(endpoint_id, path):
+    return {
+        "event": {
+            "endpointId": endpoint_id,
+            "context": {
+                "invoke_id": "req-1",
+                "client_context": None,
+                "cognito_identity": None,
+                "epoch_deadline_time_in_ms": 0,
+                "invoked_function_arn": "arn:aws:lambda:us-east-1:123456789:function:test",
+                "tenant_id": None,
+            },
+            "event": {"path": str(path)},
+        }
+    }
+
+
+@mark.parametrize("delete_source", [False, True], ids=["present", "deleted-before-invoke"])
+def test_bridge_preserves_project_file_reads_with_links(
+    pulumi_mocks, project_cwd, dev_mode_context, delete_source
+):
+    source = project_cwd / "ca.pem"
+    source.write_text("certificate")
+    (project_cwd / "project.txt").write_text("project data")
+    link = Link("certs", {}, [], _files={"certs/ca.pem": source})
+    function = Function("fn", handler="functions/link_files.handler", links=[link])
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+    inputs = pulumi_mocks.assert_res("fn", R.FUNCTION).inputs
+    endpoint_id = inputs["environment"]["variables"]["STLV_DEV_ENDPOINT_ID"]
+    bridge_event = _file_read_bridge_event(endpoint_id, "project.txt")
+    if delete_source:
+        source.unlink()
+
+    @pulumi.runtime.test
+    async def invoke():
+        for _ in range(2):
+            result = await function.handle_bridge_event(bridge_event)
+            assert result.error_result is None
+            assert result.success_result == {
+                "cwd": str(project_cwd),
+                "contents": "project data",
+            }
+            assert Path.cwd() == project_cwd
+
+    invoke()
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+def test_bridge_returns_missing_link_source_error_and_recovers(
+    pulumi_mocks, project_cwd, dev_mode_context
+):
+    source = project_cwd / "ca.pem"
+    source.write_text("certificate")
+    link = Link("certs", {}, [], _files={"certs/ca.pem": source})
+    function = Function("fn", handler="functions/link_files.handler", links=[link])
+
+    @pulumi.runtime.test
+    def deploy():
+        return function.resources
+
+    deploy()
+    inputs = pulumi_mocks.assert_res("fn", R.FUNCTION).inputs
+    endpoint_id = inputs["environment"]["variables"]["STLV_DEV_ENDPOINT_ID"]
+    bridge_event = _file_read_bridge_event(endpoint_id, source)
+    source.unlink()
+
+    @pulumi.runtime.test
+    async def invoke():
+        failed = await function.handle_bridge_event(bridge_event)
+        assert failed.success_result is None
+        assert isinstance(failed.error_result, FileNotFoundError)
+        assert failed.error_result.filename == str(source)
+        assert failed.status_code == -1
+        assert Path.cwd() == project_cwd
+
+        source.write_text("restored certificate")
+        recovered = await function.handle_bridge_event(bridge_event)
+        assert recovered.error_result is None
+        assert recovered.success_result == {
+            "cwd": str(project_cwd),
+            "contents": "restored certificate",
+        }
+        assert Path.cwd() == project_cwd
+
+    invoke()
+    pulumi_mocks.assert_res_counts({R.FUNCTION: 1, R.ROLE: 1, R.ROLE_POLICY_ATTACHMENT: 1})
+
+
+def test_permission_only_link_named_like_a_linked_queue_keeps_its_resources(
+    pulumi_mocks, project_cwd
+):
+    # Listed after the queue: a last-one-wins merge would drop Resources.orders.
+    orders = Queue("orders")
+    extra = Link("orders", {}, [AwsPermission(actions=["sqs:ListQueues"], resources=["*"])])
+
+    @pulumi.runtime.test
+    def deploy():
+        return Function("fn", handler="functions/simple.handler", links=[orders, extra]).resources
+
+    deploy()
+
+    fn = pulumi_mocks.assert_res("fn", R.FUNCTION)
+    assert "stlv_resources.py" in fn.inputs["code"].assets
+    assert "class OrdersResource" in (project_cwd / "functions/stlv_resources.py").read_text()

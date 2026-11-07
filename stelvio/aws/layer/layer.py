@@ -1,0 +1,245 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Final, TypedDict, Unpack, final
+
+from pulumi import Archive, Asset, AssetArchive, FileArchive, Output
+from pulumi_aws.lambda_ import LayerVersion
+
+from stelvio.aws._packaging.dependencies import get_or_install_dependencies, requirements_spec
+from stelvio.aws.types import (
+    DEFAULT_ARCHITECTURE,
+    DEFAULT_RUNTIME,
+    AwsArchitecture,
+    AwsLambdaRuntime,
+)
+from stelvio.component import Component, parse_config, resource_name
+from stelvio.project import get_project_root
+from stelvio.provider import ProviderStore
+
+if TYPE_CHECKING:
+    from pulumi_aws.lambda_ import LayerVersionArgs
+
+    from stelvio.customize import Customization
+
+logger = logging.getLogger(__name__)
+
+_LAYER_CACHE_SUBDIR: Final[str] = "layers"
+# CreateFunction.Layers caps each version ARN at 140 chars, leaving ~86 for the name;
+# LayerName itself allows 140 only because the field also accepts ARNs.
+MAX_LAYER_NAME_LENGTH = 80
+
+
+__all__ = ["Layer", "LayerConfig", "LayerConfigDict", "LayerResources"]
+
+
+@final
+@dataclass(frozen=True, kw_only=True)
+class LayerConfig:
+    """Layer configuration."""
+
+    code: str | None = None
+    requirements: str | list[str] | bool | None = None
+    runtime: AwsLambdaRuntime | None = None
+    architecture: AwsArchitecture | None = None
+
+
+class LayerConfigDict(TypedDict, total=False):
+    """Layer configuration dictionary."""
+
+    code: str | None
+    requirements: str | list[str] | bool | None
+    runtime: AwsLambdaRuntime | None
+    architecture: AwsArchitecture | None
+
+
+@final
+@dataclass(frozen=True)
+class LayerResources:
+    """Represents the AWS resources created for a Stelvio Layer component."""
+
+    layer_version: LayerVersion
+
+
+class LayerCustomizationDict(TypedDict, total=False):
+    layer_version: Customization[LayerVersionArgs]
+
+
+@final
+class Layer(Component[LayerResources, LayerCustomizationDict]):
+    """
+    Represents an AWS Lambda Layer, enabling code and dependency sharing.
+
+    This component manages the creation and versioning of an AWS Lambda LayerVersion
+    based on the provided code and/or requirements. Stelvio automatically handles
+    packaging according to AWS standards (e.g., placing code under 'python/').
+
+    Args:
+        name: The logical name of the layer component within the Stelvio application.
+        code: Path (relative to project root) to the directory containing the layer's
+              Python code (e.g., "src/my_utils"). The directory itself (e.g., "my_utils")
+              will be placed under 'python/' in the layer archive, making it importable
+              (e.g., `from my_utils import ...`). If None, the layer contains only dependencies.
+        requirements: Specifies Python package dependencies. Accepts a path string to a
+                      requirements file (relative to project root), a list of
+                      requirement strings (e.g., `["requests", "boto3"]`), or
+                      `False` (to explicitly disable). If `None` (default), no
+                      dependencies are installed. No default file lookup occurs.
+        runtime: The compatible Lambda runtime identifier (e.g., "python3.12").
+                 Defaults to the project's default runtime if None.
+        architecture: The compatible instruction set architecture (e.g., "x86_64").
+                      Defaults to the project's default architecture if None.
+    """
+
+    _config: LayerConfig
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        config: LayerConfig | LayerConfigDict | None = None,
+        customize: LayerCustomizationDict | None = None,
+        **opts: Unpack[LayerConfigDict],
+    ):
+        super().__init__(ProviderStore.aws(), "stelvio:aws:Layer", name, customize=customize)
+        self._config = parse_config(LayerConfig, config, opts)
+
+        if not self._config.code and not self._config.requirements:
+            raise ValueError(f"Layer '{name}' must specify 'code' and/or 'requirements'.")
+        self._validate_requirements()
+        # TODO: validate arch and runtime values
+
+    def _validate_requirements(self) -> None:
+        requirements = self._config.requirements
+        if isinstance(requirements, str) and not requirements.strip():
+            raise ValueError("If 'requirements' is a string (path), it cannot be empty.")
+        if not requirements:
+            return
+
+        if isinstance(requirements, list):
+            if not all(isinstance(item, str) for item in requirements):
+                raise TypeError("If 'requirements' is a list, all its elements must be strings.")
+        elif not isinstance(requirements, str):
+            raise TypeError(
+                f"'requirements' must be a string (path), list of strings, or None. "
+                f"Got type: {type(requirements).__name__}."
+            )
+
+    @property
+    def config(self) -> LayerConfig:
+        return self._config
+
+    @property
+    def runtime(self) -> str | None:
+        return self._config.runtime
+
+    @property
+    def architecture(self) -> str | None:
+        return self._config.architecture
+
+    @property
+    def arn(self) -> Output[str]:
+        return self.resources.layer_version.arn
+
+    def _create_resources(self) -> LayerResources:
+        logger.debug("Creating resources for Layer '%s'", self.name)
+        log_context = f"Layer: {self.name}"
+
+        runtime = self._config.runtime or DEFAULT_RUNTIME
+        architecture = self._config.architecture or DEFAULT_ARCHITECTURE
+
+        assets = _gather_layer_assets(
+            code=self._config.code,
+            requirements=self._config.requirements,
+            log_context=log_context,
+            runtime=runtime,
+            architecture=architecture,
+        )
+
+        if not assets:
+            raise ValueError(
+                f"[{log_context}] Layer must contain code or requirements, "
+                f"but resulted in an empty package."
+            )
+
+        asset_archive = AssetArchive(assets)
+
+        # Deterministic on purpose: versions group under the layer name
+        layer_name = resource_name(self.name, limit=MAX_LAYER_NAME_LENGTH, pulumi_suffix_length=0)
+        layer_version_resource = LayerVersion(
+            layer_name,
+            **self._customizer(
+                "layer_version",
+                {
+                    "code": asset_archive,
+                    # Explicit even when defaulted: the deps above were built for exactly these,
+                    # so an app-wide customize dict must not relabel them.
+                    "compatible_runtimes": [runtime],
+                    "compatible_architectures": [architecture],
+                },
+                {"layer_name": layer_name},
+            ),
+            opts=self._resource_opts(),
+        )
+
+        return LayerResources(layer_version=layer_version_resource)
+
+
+def _gather_layer_assets(
+    code: str | None,
+    requirements: str | list[str] | bool | None,
+    log_context: str,
+    runtime: str,
+    architecture: str,
+) -> dict[str, Asset | Archive]:
+    assets: dict[str, Asset | Archive] = {}
+    project_root = get_project_root()
+    if code:
+        code_path_relative = Path(code)
+        code_path_abs = (project_root / code_path_relative).resolve()
+
+        try:
+            _ = code_path_abs.relative_to(project_root)
+        except ValueError:
+            raise ValueError(
+                f"Code path  '{code_path_relative}' resolves to '{code_path_abs}', "
+                f"which is outside the project root '{project_root}'."
+            ) from None
+
+        if not code_path_abs.is_dir():
+            raise ValueError(f"[{log_context}] Code path '{code_path_abs}' is not a directory.")
+
+        code_dir_name = code_path_abs.name
+        archive_code_path = f"python/{code_dir_name}"
+        logger.debug(
+            "[%s] Packaging code directory '%s' into archive path '%s'",
+            log_context,
+            code_path_abs,
+            archive_code_path,
+        )
+        assets[archive_code_path] = FileArchive(str(code_path_abs))
+
+    source = requirements_spec(requirements)
+
+    if source:
+        logger.debug("[%s] Requirements source identified, ensuring installation.", log_context)
+        cache_dir = get_or_install_dependencies(
+            requirements_source=source,
+            runtime=runtime,
+            architecture=architecture,
+            project_root=project_root,
+            cache_subdirectory=_LAYER_CACHE_SUBDIR,
+            log_context=log_context,
+        )
+        # Package the entire cache directory into the standard layer path
+        dep_archive_path = f"python/lib/{runtime}/site-packages"
+        logger.debug(
+            "[%s] Packaging dependency cache '%s' into archive path '%s'",
+            log_context,
+            cache_dir,
+            dep_archive_path,
+        )
+        assets[dep_archive_path] = FileArchive(str(cache_dir))
+    return assets

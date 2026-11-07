@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish_target:
+        description: 'Where to publish (for testing the workflow)'
+        required: true
+        type: choice
+        options:
+          - testpypi
+          - none
+        default: testpypi
+
+jobs:
+  validate-build-release:
+    name: Validate, Test, Build & Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Require tag on main
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_REF_NAME}" --jq .status)
+          if [ "${STATUS}" != "identical" ] && [ "${STATUS}" != "behind" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} is not on main (compare status: ${STATUS})"
+            exit 1
+          fi
+
+      - name: Checkout at tag
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.5"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Validate version matches tag
+        if: github.event_name == 'push'
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          PYPROJECT_VERSION=$(uv run python -c "
+          import re
+          with open('pyproject.toml') as f:
+              match = re.search(r'^version\s*=\s*\"([^\"]+)\"', f.read(), re.MULTILINE)
+              print(match.group(1) if match else '')
+          ")
+          if [ "${VERSION}" != "${PYPROJECT_VERSION}" ]; then
+            echo "::error::Version mismatch: tag '${TAG}' implies version '${VERSION}' but pyproject.toml has '${PYPROJECT_VERSION}'"
+            exit 1
+          fi
+          echo "Version '${VERSION}' matches pyproject.toml"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Read version from pyproject.toml
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          VERSION=$(uv run python -c "
+          import re
+          with open('pyproject.toml') as f:
+              match = re.search(r'^version\s*=\s*\"([^\"]+)\"', f.read(), re.MULTILINE)
+              print(match.group(1) if match else '')
+          ")
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "Using version '${VERSION}' from pyproject.toml (manual dispatch)"
+
+      - name: Validate changelog
+        if: github.event_name == 'push'
+        run: |
+          CHANGELOG="docs/docs/changelog.md"
+          HEADING=$(grep -n "^## ${VERSION}" "${CHANGELOG}" | head -1)
+          if [ -z "${HEADING}" ]; then
+            echo "::error::No changelog section found for version '${VERSION}' in ${CHANGELOG}"
+            exit 1
+          fi
+          HEADING_LINE=$(echo "${HEADING}" | cut -d: -f2-)
+          if echo "${HEADING_LINE}" | grep -qE '\bMM\b|\bDD\b'; then
+            echo "::error::Changelog heading has date placeholders: ${HEADING_LINE}"
+            exit 1
+          fi
+          echo "Changelog section found: ${HEADING_LINE}"
+
+      - name: Install the project
+        run: uv sync --locked --dev
+
+      - name: Run tests
+        run: uv run pytest tests
+
+      - name: Build
+        run: uv build
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Extract changelog and create GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CHANGELOG="docs/docs/changelog.md"
+
+          # Extract heading line for the title
+          HEADING_LINE=$(grep "^## ${VERSION}" "${CHANGELOG}" | head -1 | sed 's/^## //')
+          RELEASE_TITLE="${HEADING_LINE}"
+
+          # Extract body: everything between this ## heading and the next ## heading (or EOF)
+          HEADING_LINENUM=$(grep -n "^## ${VERSION}" "${CHANGELOG}" | head -1 | cut -d: -f1)
+          NEXT_HEADING_LINENUM=$(tail -n +"$((HEADING_LINENUM + 1))" "${CHANGELOG}" | grep -n "^## " | head -1 | cut -d: -f1)
+
+          if [ -n "${NEXT_HEADING_LINENUM}" ]; then
+            # next heading is relative to HEADING_LINENUM+1, convert to absolute
+            END_LINENUM=$((HEADING_LINENUM + NEXT_HEADING_LINENUM - 1))
+            sed -n "$((HEADING_LINENUM + 1)),$((END_LINENUM))p" "${CHANGELOG}" > /tmp/release-notes.md
+          else
+            tail -n +"$((HEADING_LINENUM + 1))" "${CHANGELOG}" > /tmp/release-notes.md
+          fi
+
+          # Trim leading/trailing blank lines
+          sed -i '/./,$!d' /tmp/release-notes.md
+          sed -i -e :a -e '/^\n*$/{$d;N;ba;}' /tmp/release-notes.md
+
+          # GitHub resolves relative links in release bodies against the REPO
+          # ROOT, not the changelog's directory, so the page-relative links that
+          # work on the docs site 404 on the release page. Rewrite to absolute
+          # docs URLs (anchors preserved; already-absolute links are untouched).
+          sed -i -E 's|\]\(([^)#:]+)\.md(#[^)]*)?\)|](https://stelvio.dev/docs/\1/\2)|g' /tmp/release-notes.md
+
+          # Always --latest: GitHub can't mark a pre-release as latest, and every
+          # beta is the version people should install. To show alphas or release
+          # candidates as pre-releases again, restore this and pass
+          # ${PRERELEASE_FLAG} instead of --latest below:
+          #
+          #   if echo "${VERSION}" | grep -qE '(a|rc)[0-9]'; then
+          #     PRERELEASE_FLAG="--prerelease"
+          #   else
+          #     PRERELEASE_FLAG="--latest"
+          #   fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${RELEASE_TITLE}" \
+            --notes-file /tmp/release-notes.md \
+            --latest \
+            dist/*
+
+  publish-test-pypi:
+    name: Publish to Test PyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_target == 'testpypi'
+    needs: validate-build-release
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to Test PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'push'
+    needs: validate-build-release
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-demo:
+    name: Publish demo copy
+    if: github.event_name == 'push'
+    needs: publish-pypi
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-copy.yml
+    with:
+      source_sha: ${{ github.sha }}
+      source_path: demo
+      target_repository: stelviodev/demo
+    secrets:
+      REPO_SPLIT_APP_ID: ${{ secrets.REPO_SPLIT_APP_ID }}
+      REPO_SPLIT_APP_PRIVATE_KEY: ${{ secrets.REPO_SPLIT_APP_PRIVATE_KEY }}
+
+  publish-templates:
+    name: Publish templates copy
+    if: github.event_name == 'push'
+    needs: publish-pypi
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-copy.yml
+    with:
+      source_sha: ${{ github.sha }}
+      source_path: templates
+      target_repository: stelviodev/templates
+    secrets:
+      REPO_SPLIT_APP_ID: ${{ secrets.REPO_SPLIT_APP_ID }}
+      REPO_SPLIT_APP_PRIVATE_KEY: ${{ secrets.REPO_SPLIT_APP_PRIVATE_KEY }}
